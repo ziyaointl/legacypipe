@@ -330,7 +330,8 @@ def get_star_locations(ps1_table, wcs, ccd_shape, min_separation=10./0.263):
                       to one another than this distance will be rejected.
 
     Outputs:
-      # TODO
+      star_x  x-coordinates (in pixels) of the stars on the CCD.
+      star_y  y-coordinates (in pixels) of the stars on the CCD.
     '''
     # Get stellar pixel coordinates
     star_y, star_x = wcs.wcs_world2pix(ps1_table['RA'], ps1_table['DEC'], 0)   # 0 is the coordinate in the top left (the numpy, but not FITS standard)
@@ -391,7 +392,7 @@ def get_ps1_stars_for_ccd(wcs, ccd_shape, min_separation):
     '''
 
     # Load locations of PS1 stars
-    fname = '/home/greg/Downloads/psftest/ps1stars-c4d_150109_051822.fits'
+    fname = 'psftest/ps1stars-c4d_150109_051822.fits'
     ps1_table = astropy.io.fits.getdata(fname, 1)
     # TODO: Replace this with call to ps1cat.ps1cat
 
@@ -498,7 +499,7 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
 
 def test_sinc_shift_image():
     from PIL import Image
-    im = Image.open('/home/greg/Downloads/download.png')
+    im = Image.open('psftest/shift.png')
     img = np.sum(np.array(im)[:,:,:3], axis=2)
 
     import matplotlib.pyplot as plt
@@ -554,11 +555,11 @@ def test_find_star_centers():
 
 def test_load_exposure():
     # Load a test image
-    fname_pattern = '/home/greg/Downloads/psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
     img_data, weight_data, mask_data, wcs = load_exposure(fname_pattern, 'S31')
 
     # Load locations of PS1 stars
-    fname = '/home/greg/Downloads/psftest/ps1stars-c4d_150109_051822.fits'
+    fname = 'psftest/ps1stars-c4d_150109_051822.fits'
     ps1_table = astropy.io.fits.getdata(fname, 1)
     star_x, star_y = get_star_locations(ps1_table, wcs, img_data.shape, min_separation=50)
 
@@ -738,7 +739,7 @@ def test_filter_neighbors():
 
 def test_extract_psf():
     # Load a test image
-    fname_pattern = '/home/greg/Downloads/psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
     img_data, weight_data, mask_data, wcs = load_exposure(fname_pattern, 'S31')
 
     psf_coeffs = extract_psf(exposure_img, weight_img, mask_img, wcs)
@@ -749,10 +750,6 @@ def test_extract_psf():
 
 def main():
     test_load_exposure()
-
-    #fname_pattern = '/home/greg/Downloads/psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
-    #img_data, weight_data, wcs = load_exposure(fname_pattern, 'S31')
-
 
     return 0
 
