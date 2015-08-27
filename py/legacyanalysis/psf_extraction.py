@@ -316,6 +316,22 @@ def filter_postage_stamps(ps_mask, min_pixel_fraction=0.5):
 
 
 def get_star_locations(ps1_table, wcs, ccd_shape, min_separation=10./0.263):
+    '''
+    Get pixel coordinates of PS1 stars that fall on a given DECam CCD exposure.
+
+    Inputs:
+      ps1_table  A table of PS1 detections that fall on the given exposure.
+      wcs        A World Coordinate System object describing the projection
+                 of the CCD.
+      ccd_shape  The shape (in pixels) of the CCD: (x extent, y extent).
+
+    Optional parameters:
+      min_separation  Minimum separation (in pixels) between stars. Stars closer
+                      to one another than this distance will be rejected.
+
+    Outputs:
+      # TODO
+    '''
     # Get stellar pixel coordinates
     star_y, star_x = wcs.wcs_world2pix(ps1_table['RA'], ps1_table['DEC'], 0)   # 0 is the coordinate in the top left (the numpy, but not FITS standard)
 
@@ -358,16 +374,126 @@ def filter_ps1_quality(ps1_table):
     return idx
 
 
-def extract_psf(exposure_img, error_img, wcs, star_world_coords):
-    # select stars (from PS1)
+def get_ps1_stars_for_ccd(wcs, ccd_shape, min_separation):
+    '''
+    Returns pixel coordinates for stars detected by PS1 that fall on the CCD.
 
-    # center stars (using sinc shift)
+    Inputs:
+      wcs             A World Coordinate System object describing the projection
+                      of the CCD.
+      ccd_shape       The shape (in pixels) of the CCD: (x extent, y extent).
+      min_separation  Minimum separation (in pixels) between stars. Stars closer
+                      to one another than this distance will be rejected.
+
+    Ouptuts:
+      star_x  x-coordinates of the PS1 stars (in pixels).
+      star_y  y-coordinates of the PS1 stars (in pixels).
+    '''
+
+    # Load locations of PS1 stars
+    fname = '/home/greg/Downloads/psftest/ps1stars-c4d_150109_051822.fits'
+    ps1_table = astropy.io.fits.getdata(fname, 1)
+    # TODO: Replace this with call to ps1cat.ps1cat
+
+    star_x, star_y = get_star_locations(ps1_table, wcs, ccd_shape,
+                                        min_separation=min_separation)
+
+    return star_x, star_y
+
+
+def extract_psf(exposure_img, weight_img, mask_img, wcs,
+                min_separation=50., min_pixel_fraction=0.5, n_iter=1,
+                psf_halfwidth=31, buffer_width=10, avoid_edges=1,
+                return_postage_stamps=False):
+    '''
+    Extract the PSF from a CCD exposure, using a pixel basis. Each pixel is
+    represented as a polynomial in (x,y), where x and y are the pixel
+    coordinates on the CCD.
+
+    Inputs:
+      exposure_img  CCD counts image.
+      weight_img    CCD weight image.
+      mask_img      CCD mask image.
+      wcs           A World Coordinate System object describing the projection
+                    of the CCD.
+
+    Optional parameters:
+      n_iter              # of iterations to run for. Each iteration consists of
+                          fitting the stellar fluxes and local sky levels, given
+                          the current PSF fit, and then updating the PSF fit,
+                          based on the stars.
+      psf_halfwidth       The width/height of the PSF image will be 2*psf_halfwidth+1.
+      min_separation      Minimum separation (in pixels) between stars. Stars closer
+                          to one another than this distance will be rejected.
+      min_pixel_fraction  Minimum fraction of pixels around a star that must be
+                          unmasked in order for the star to be used for the fit.
+      buffer_width        # of pixels to expand postage stamps by on each edge
+                          during intermediate processing.
+      avoid_edges         # of pixels on each edge of the CCD to avoid.
+      return_postage_stamps  If True, return a stack of postage stamps of the
+                             stars used in the fit.
+
+    Output:
+      psf_coeffs  The polynomial coefficients for each PSF pixel. The shape of
+                  the output is (polynomial order, x, y).
+
+    Returned if return_postage_stamps == True:
+      ps_exposure  Counts postage stamps of the stars used in the fit. The shape
+                   if (# of stars, x, y).
+      ps_weight    Weight postage stamps for the stars used in the fit. The shape
+                   if (# of stars, x, y).
+      ps_mask      Mask postage stamps for the stars used in the fit. The shape
+                   if (# of stars, x, y).
+    '''
+    # select stars (from PS1)
+    ccd_shape = exposure_img.shape
+    star_x, star_y = get_ps1_stars_for_ccd(wcs, ccd_shape,
+                                           min_separation=min_separation)
+
+    # Extract centered postage stamps of stars, sinc shifting stars as necessary
+    ps_exposure, ps_weight, ps_mask = extract_stars(exposure_img, weight_img,
+                                                    mask_img, star_x, star_y,
+                                                    width=psf_halfwidth,
+                                                    buffer_width=buffer_width,
+                                                    avoid_edges=avoid_edges)
+
+    # Filter out stars that are more than a certain percent masked
+    idx = filter_postage_stamps(ps_mask, min_pixel_fraction=0.5)
+    ps_exposure = ps_exposure[idx]
+    ps_weight = ps_weight[idx]
+    ps_mask = ps_mask[idx]
+    star_x = star_x[idx]
+    star_y = star_y[idx]
+
+    # Guess the PSF by median-stacking pristine postage stamps (no masked pixels)
+    psf_guess = guess_psf(ps_exposure, ps_weight, ps_mask)
+
     # standardize brightness of each star (either using PS1 or by scaling to median)
     # In loop:
     #   solve linear equation to minimize residuals between model and data
     #     --> reject saturated pixels
     #   update brightness of each star
-    pass
+
+    # The fit parameters
+    n_stars = ps_exposure.shape[0]
+    psf_coeffs = np.zeros((6, ps_exposure.shape[1], ps_exposure.shape[2]), dtype='f8')
+    psf_coeffs[0,:,:] = psf_guess[:,:]
+    stellar_flux = np.empty(n_stars, dtype='f8')
+    sky_level = np.empty(n_stars, dytpe='f8')
+
+    for j in range(n_iter):
+        # Fit the flux and local sky level for each star
+        for k in range(n_stars):
+            stellar_flux[k], sky_level[k] = fit_star_params(psf_coeffs,
+                                                            star_x[k], star_y[k],
+                                                            ps_exposure[k], ps_weight[k],
+                                                            ps_mask[k])
+
+        # Fit the PSF coefficients in each pixel
+        psf_coeffs = fit_psf_coeffs(stellar_flux, sky_level, star_x, star_y,
+                                    ccd_shape, ps_exposure, ps_weight, ps_mask)
+
+    return psf_coeffs
 
 
 def test_sinc_shift_image():
@@ -608,6 +734,17 @@ def test_filter_neighbors():
     ax.scatter(x[~idx], y[~idx], c='r')
 
     plt.show()
+
+
+def test_extract_psf():
+    # Load a test image
+    fname_pattern = '/home/greg/Downloads/psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    img_data, weight_data, mask_data, wcs = load_exposure(fname_pattern, 'S31')
+
+    psf_coeffs = extract_psf(exposure_img, weight_img, mask_img, wcs)
+
+    print psf_coeffs
+
 
 
 def main():
