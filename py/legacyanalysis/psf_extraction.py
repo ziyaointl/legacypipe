@@ -958,6 +958,9 @@ def test_extract_psf():
                                         return_postage_stamps=True, n_iter=1,
                                         min_pixel_fraction=0.9999)
 
+    n_stars = star_dict['ps_exposure'].shape[0]
+    ccd_shape = img_data.shape
+
     # Calculate centers of mass
     #print 'Centers of mass:'
 
@@ -981,23 +984,35 @@ def test_extract_psf():
                                 star_dict['stellar_flux'], star_dict['sky_level'],
                                 ccd_shape)
 
+    # Calculate corrections to fluxes, by normalizing PSFs
+    psf_norm = np.empty(n_stars, dtype='f8')
+
+    for k in range(n_stars):
+        # Evaluate the PSF at the location of the star
+        psf_model = eval_psf(psf_coeffs, star_dict['star_x'][k],
+                             star_dict['star_y'][k], ccd_shape)
+        psf_norm[k] = np.sum(psf_model)
+
+    #star_dict['stellar_flux'] *= psf_norm
+
     import matplotlib.pyplot as plt
 
     # Scatterplot of PS1 flux with inferred flux
     fig = plt.figure(figsize=(16,8), dpi=100)
 
     ps1_flux = 10.**(-(star_dict['star_ps1_mag']-20.) / 2.5)
-    fit_mag = -2.5 * np.log10(star_dict['stellar_flux'])
+    fit_flux = star_dict['stellar_flux'] * psf_norm
+    fit_mag = -2.5 * np.log10(fit_flux)
 
     idx_ps1_good = (star_dict['star_ps1_mag'][:,3] > 10.) & (star_dict['star_ps1_mag'][:,3] < 25.)
     mag_offset = np.median(fit_mag[idx_ps1_good] - star_dict['star_ps1_mag'][idx_ps1_good,3])
-    flux_scaling = np.median(star_dict['stellar_flux'][idx_ps1_good] / ps1_flux[idx_ps1_good,3])
+    flux_scaling = np.median(fit_flux[idx_ps1_good] / ps1_flux[idx_ps1_good,3])
 
     print 'Magnitude offset: {}'.format(mag_offset)
     print 'Flux scaling: {}'.format(flux_scaling)
 
     ax = fig.add_subplot(1,2,1)
-    ax.scatter(ps1_flux[idx_ps1_good,3], star_dict['stellar_flux'][idx_ps1_good],
+    ax.scatter(ps1_flux[idx_ps1_good,3], fit_flux[idx_ps1_good],
                edgecolor='none', facecolor='r', s=10)
     ax.set_xlabel(r'$f_{\mathrm{P1}}$', fontsize=18)
     ax.set_ylabel(r'$f_{\mathrm{fit}}$', fontsize=18)
@@ -1082,8 +1097,6 @@ def test_extract_psf():
     plt.close(fig)
 
     # Plot postage stamps of the stars
-    n_stars = star_dict['ps_exposure'].shape[0]
-    ccd_shape = img_data.shape
     ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
     ps_y_cent = 0.5 * float(star_dict['ps_exposure'].shape[2]-1.)
 
