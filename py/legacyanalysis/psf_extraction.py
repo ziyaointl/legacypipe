@@ -10,6 +10,83 @@ import astropy.convolution
 from sklearn.neighbors import NearestNeighbors
 
 
+def img_center_of_mass(img, img_mask):
+    idx = ~np.isfinite(img) | (img_mask != 0) # Determine image mask
+    idx |= idx[:,::-1] | idx[::-1,:] # Make mask symmetric under parity flips
+    img_clean = np.empty(img.shape, dtype='f8')
+    img_clean[:] = img[:]
+    img_clean[idx] = 0.
+
+    print np.sum(~np.isfinite(img_clean))
+    print np.sum(img_clean)
+
+    return scipy.ndimage.measurements.center_of_mass(img_clean)
+
+
+def gen_centered_weights(shape, sigma):
+    '''
+    Return a weight image that weights pixels towards the center of the image
+    more strongly than pixels away from the center.
+    '''
+    return np.array(astropy.convolution.Gaussian2DKernel(
+        sigma, x_size=shape[0], y_size=shape[1],
+        mode='oversample', factor=5
+    ))
+
+
+def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
+                            ps_exposure, ps_weight, ps_mask, **kwargs):
+    '''
+    Recenter a stack of postage stamps, trying to properly centroid each star.
+    Should work for small shifts (< 1 pixel). Calculates a weighted center of
+    mass for each postage stamp (the weighting ignores pixels away from the
+    center of the image), and then going back into the original exposure image
+    and extracting the stars again.
+    '''
+
+    max_shift = kwargs.pop('max_shift', 2.)
+
+    # Weight to apply to each image before calculating center of mass
+    w_cent = gen_centered_weights(ps_exposure.shape[1:], 3.)
+
+    dxy = []
+    star_x_cent, star_y_cent = [], []
+
+    # Calculate the weighted center of mass of each postage stamp
+    for ps_img, ps_mask in zip(ps_exposure, ps_mask):
+        dxy.append(img_center_of_mass(ps_img*w_cent, ps_mask))
+
+    dxy = np.array(dxy)
+    dxy[:,0] -= 0.5 * float(ps_exposure.shape[1]-1.)
+    dxy[:,1] -= 0.5 * float(ps_exposure.shape[2]-1.)
+
+    # Find the stars that have only small shifts
+    idx_good = np.all((np.abs(dxy) < max_shift) & np.isfinite(dxy), axis=1)
+
+    # Apply the small shifts to the stellar positions
+    star_x_cent = np.array(star_x)
+    star_y_cent = np.array(star_y)
+    star_x_cent[idx_good] += dxy[idx_good, 0]
+    star_y_cent[idx_good] += dxy[idx_good, 1]
+
+    print 'x shifts:'
+    print star_x_cent - np.array(star_x)
+    print ''
+    print 'y shifts:'
+    print star_y_cent - np.array(star_y)
+    print ''
+    print 'dx percentiles:'
+    print np.percentile(dxy[idx_good,0], [1., 10., 50., 90., 99.])
+    print 'dy percentiles:'
+    print np.percentile(dxy[idx_good,1], [1., 10., 50., 90., 99.])
+    print ''
+
+    ret = extract_stars(exposure_img, weight_img, mask_img,
+                        star_x_cent, star_y_cent, **kwargs)
+
+    return ret
+
+
 def sinc_shift_image(img, dx, dy):
     '''
     Shift a real-valued image by (dx,dy), using the DFT shift theorem.
@@ -130,9 +207,8 @@ def fit_psf_coeffs(star_flux, star_sky,
     img_zeroed[ps_mask != 0] = 0.
 
     # Transform pixel weights
-    #sqrt_w = np.ones(ps_weight.shape, dtype='f8')
-    sqrt_w = np.sqrt(ps_weight)# / star_flux[:,None,None]
-    sqrt_w[ps_mask != 0] = 0 # Zero weight for masked pixels
+    sqrt_w = np.sqrt(ps_weight)
+    sqrt_w[ps_mask != 0] = 0. # Zero weight for masked pixels
 
     # Design matrix
     A_base = np.empty((n_stars+6, 6), dtype='f8') # without per-pixel weights
@@ -159,12 +235,16 @@ def fit_psf_coeffs(star_flux, star_sky,
         for k in range(n_y):
             # Design matrix
             A[:] = A_base[:]
-            A[:n_stars,:] *= sqrt_w[:,None,j,k]
+            #A[:n_stars,:] *= sqrt_w[:,None,j,k]
             A[-6] *= 0.
             A[-5:] *= 1. / np.sqrt(sigma_nonzero_order)
 
+            #print ''
+            #print A[-6:]
+            #print ''
+
             # Data matrix
-            b[:n_stars] = img_zeroed[:,j,k] * star_flux[:] * sqrt_w[:n_stars,j,k]
+            b[:n_stars] = img_zeroed[:,j,k] * star_flux[:] #* sqrt_w[:n_stars,j,k]
 
             # Remove NaN and Inf values
             A[~np.isfinite(A)] = 0.
@@ -482,7 +562,7 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
 def extract_psf(exposure_img, weight_img, mask_img, wcs,
                 min_separation=50., min_pixel_fraction=0.5, n_iter=1,
                 psf_halfwidth=31, buffer_width=10, avoid_edges=1,
-                star_chisq_threshold=5., return_postage_stamps=False):
+                star_chisq_threshold=2., return_postage_stamps=False):
     '''
     Extract the PSF from a CCD exposure, using a pixel basis. Each pixel is
     represented as a polynomial in (x,y), where x and y are the pixel
@@ -547,6 +627,16 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
                                                     buffer_width=buffer_width,
                                                     avoid_edges=avoid_edges)
 
+    # Recenter the postage stamps
+    ps_exposure, ps_weight, ps_mask = recenter_postage_stamps(
+        exposure_img, weight_img, mask_img,
+        star_x, star_y,
+        ps_exposure, ps_weight, ps_mask,
+        width=psf_halfwidth,
+        buffer_width=buffer_width,
+        avoid_edges=avoid_edges
+    )
+
     # Filter out stars that are more than a certain percent masked
     idx = filter_postage_stamps(ps_mask, min_pixel_fraction=min_pixel_fraction)
     ps_exposure = ps_exposure[idx]
@@ -579,6 +669,9 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
                                      star_x, star_y, stellar_flux, sky_level,
                                      ccd_shape)
         idx = (star_chisq < star_chisq_threshold)
+
+        print 'Rejected stars:'
+        print np.where(~idx)[0]
 
         print 'Rejected {} of {} stars.'.format(np.sum(~idx), idx.size)
 
@@ -865,6 +958,22 @@ def test_extract_psf():
                                         return_postage_stamps=True, n_iter=1,
                                         min_pixel_fraction=0.9999)
 
+    # Calculate centers of mass
+    #print 'Centers of mass:'
+
+    #com_xy = []
+    #com_filt_xy = []
+
+    #width = int(np.round((star_dict['ps_exposure'].shape[1] - 1.) / 2.))
+    #w_cent = gen_centered_weights(star_dict['ps_exposure'].shape[1:], 1.)
+
+    #for ps_img, ps_mask in zip(star_dict['ps_exposure'], star_dict['ps_mask']):
+    #    com_xy.append(img_center_of_mass(ps_img, ps_mask))
+    #    com_filt_xy.append(img_center_of_mass(ps_img*w_cent, ps_mask))
+    #    print com_xy[-1], com_filt_xy[-1]
+
+    #print ''
+
     # Calculate the residuals
     psf_resid = calc_star_chisq(psf_coeffs, star_dict['ps_exposure'],
                                 star_dict['ps_weight'], star_dict['ps_mask'],
@@ -975,6 +1084,8 @@ def test_extract_psf():
     # Plot postage stamps of the stars
     n_stars = star_dict['ps_exposure'].shape[0]
     ccd_shape = img_data.shape
+    ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
+    ps_y_cent = 0.5 * float(star_dict['ps_exposure'].shape[2]-1.)
 
     n_x = int(np.ceil(np.sqrt(n_stars)))
     n_y = int(np.ceil(n_stars/float(n_x)))
@@ -999,6 +1110,9 @@ def test_extract_psf():
                   interpolation='nearest', cmap='bwr_r',
                   vmin=-ps_vmax[-1], vmax=ps_vmax[-1])
 
+        ax.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
+                                             facecolor='cyan', alpha=0.5)
+
         ax.set_xticks([])
         ax.set_yticks([])
 
@@ -1009,6 +1123,13 @@ def test_extract_psf():
 
     # Plot postage stamps of the residuals (after subtracting off model of psf)
     fig = plt.figure(figsize=(n_x,n_y), dpi=100)
+    fig_stretch = plt.figure(figsize=(n_x,n_y), dpi=100)
+
+    tmp = star_dict['ps_exposure']
+    tmp = tmp[(star_dict['ps_mask'] == 0) & np.isfinite(tmp)]
+    tmp_pctiles = np.percentile(tmp, [10., 90.])
+    tmp = tmp[(tmp > tmp_pctiles[0]) & (tmp < tmp_pctiles[1])]
+    vmax_stretch = 4. * np.std(tmp)
 
     for k in range(n_stars):
         # Evaluate the PSF at the location of the star
@@ -1030,10 +1151,14 @@ def test_extract_psf():
         tmp[star_dict['ps_mask'][k] != 0] = np.nan
 
         ax = fig.add_subplot(n_x, n_y, k+1, axisbg='g')
+        ax_stretch = fig_stretch.add_subplot(n_x, n_y, k+1, axisbg='g')
 
         ax.imshow(tmp.T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
                   vmin=-ps_vmax[k], vmax=ps_vmax[k])
+        ax_stretch.imshow(tmp.T, origin='upper', aspect='equal',
+                  interpolation='nearest', cmap='bwr_r',
+                  vmin=-vmax_stretch, vmax=vmax_stretch)
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -1041,14 +1166,25 @@ def test_extract_psf():
         y_txt = ylim[0] + 0.05 * (ylim[1] - ylim[0])
 
         ax.text(x_txt, y_txt, r'${:.1f}$'.format(psf_resid[k]))
+        ax_stretch.text(x_txt, y_txt, r'${:.1f}$'.format(psf_resid[k]))
+
+        ax.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
+                                             facecolor='cyan', alpha=0.5)
+        ax_stretch.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
+                                             facecolor='cyan', alpha=0.5)
 
         ax.set_xticks([])
         ax.set_yticks([])
+        ax_stretch.set_xticks([])
+        ax_stretch.set_yticks([])
 
     fig.subplots_adjust(wspace=0.01, hspace=0.01)
+    fig_stretch.subplots_adjust(wspace=0.01, hspace=0.01)
 
     fig.savefig('postage_stamps_resid.png', dpi=300, bbox_inches='tight')
+    fig_stretch.savefig('postage_stamps_resid_stretch.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
+    plt.close(fig_stretch)
 
     # Plot the CCD image and weight, with stellar locations from PS1 overplotted
     vmin, vmax = np.percentile(img_data[(img_data > 1.) & (mask_data == 0)], [1.,99.])
