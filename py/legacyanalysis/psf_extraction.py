@@ -6,32 +6,80 @@ import scipy.ndimage
 import astropy.wcs
 import astropy.io
 import astropy.convolution
+import astropy.modeling
+
+import warnings
 
 from sklearn.neighbors import NearestNeighbors
 
 
+def fit_2d_gaussian(img):
+    '''
+    Fit a 2D Gaussian to an image. The 2D Gaussian model includes a center
+    (x, y), a standard deviation along each axis, a rotation angle and an
+    overall amplitude.
+
+    Input:
+      img  A 2D numpy array representing the image to be fit.
+
+    Output:
+      model_fit  An astropy.modeling.models.Gaussian2D object. Calling
+                 `model_fit(x,y)` will return the value of the model Gaussian
+                 at (x, y). See the astropy documentation for more details on
+                 how to interact with this class.
+    '''
+
+    shape = img.shape
+    y, x = np.mgrid[:shape[1], :shape[0]]
+
+    # Fit a 2D Gaussian to the data
+    model_guess = astropy.modeling.models.Gaussian2D(
+        x_mean=((shape[0]-1.)/2.),
+        y_mean=((shape[1]-1.)/2.),
+        x_stddev=1.,
+        y_stddev=1.,
+        amplitude=np.max(img)
+    )
+
+    fitter = astropy.modeling.fitting.LevMarLSQFitter()
+
+    with warnings.catch_warnings():
+        # Ignore model linearity warning from the fitter
+        warnings.simplefilter('default')
+        # TODO: bound the model parameters to reasonable values.
+        model_fit = fitter(model_guess, x, y, img)
+
+    return model_fit
+
+
 def img_center_of_mass(img, img_mask):
+    '''
+    '''
+
     idx = ~np.isfinite(img) | (img_mask != 0) # Determine image mask
     idx |= idx[:,::-1] | idx[::-1,:] # Make mask symmetric under parity flips
     img_clean = np.empty(img.shape, dtype='f8')
     img_clean[:] = img[:]
     img_clean[idx] = 0.
 
-    print np.sum(~np.isfinite(img_clean))
-    print np.sum(img_clean)
-
     return scipy.ndimage.measurements.center_of_mass(img_clean)
 
 
-def gen_centered_weights(shape, sigma):
+def gen_centered_weights(shape, sigma, n_sigma_clip=3.):
     '''
     Return a weight image that weights pixels towards the center of the image
     more strongly than pixels away from the center.
     '''
-    return np.array(astropy.convolution.Gaussian2DKernel(
+    w = np.array(astropy.convolution.Gaussian2DKernel(
         sigma, x_size=shape[0], y_size=shape[1],
         mode='oversample', factor=5
     ))
+
+    w /= np.max(w)
+    w[w < np.exp(-0.5 * n_sigma_clip**2.)] = 0.
+
+    return w
+
 
 
 def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
@@ -40,14 +88,16 @@ def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
     Recenter a stack of postage stamps, trying to properly centroid each star.
     Should work for small shifts (< 1 pixel). Calculates a weighted center of
     mass for each postage stamp (the weighting ignores pixels away from the
-    center of the image), and then going back into the original exposure image
-    and extracting the stars again.
+    center of the image), and then goes back into the original exposure image
+    and extracts the stars again.
     '''
 
-    max_shift = kwargs.pop('max_shift', 3.)
+    max_shift = kwargs.pop('max_shift', 2.)
 
     # Weight to apply to each image before calculating center of mass
-    w_cent = gen_centered_weights(ps_exposure.shape[1:], 2.*max_shift)
+    w_cent = gen_centered_weights(ps_exposure.shape[1:],
+                                  2.*max_shift,
+                                  n_sigma_clip=1.)
 
     dxy = []
     star_x_cent, star_y_cent = [], []
@@ -68,18 +118,6 @@ def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
     star_y_cent = np.array(star_y)
     star_x_cent[idx_good] += dxy[idx_good, 0]
     star_y_cent[idx_good] += dxy[idx_good, 1]
-
-    print 'x shifts:'
-    print star_x_cent - np.array(star_x)
-    print ''
-    print 'y shifts:'
-    print star_y_cent - np.array(star_y)
-    print ''
-    print 'dx percentiles:'
-    print np.percentile(dxy[idx_good,0], [1., 10., 50., 90., 99.])
-    print 'dy percentiles:'
-    print np.percentile(dxy[idx_good,1], [1., 10., 50., 90., 99.])
-    print ''
 
     ret = extract_stars(exposure_img, weight_img, mask_img,
                         star_x_cent, star_y_cent, **kwargs)
@@ -103,6 +141,103 @@ def sinc_shift_image(img, dx, dy):
     img_dft = np.fft.fft2(img)
     img_dft = scipy.ndimage.fourier.fourier_shift(img_dft, (dx,dy))
     return np.real(np.fft.ifft2(img_dft))
+
+
+def gen_stellar_flux_predictor(star_flux, star_ps1_mag,
+                               star_x, star_y, ccd_shape,
+                               psf_coeffs):
+    n_stars = star_flux.size
+    #print 'CCD Shape:', ccd_shape
+
+    # Calculate corrections to fluxes, by summing the PSF at the location of
+    # each star
+    psf_norm = np.empty(n_stars, dtype='f8')
+
+    for k in range(n_stars):
+        # Evaluate the PSF at the location of the star
+        psf_model = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
+        psf_norm[k] = np.sum(psf_model)
+
+    print 'PSF Norm:', psf_norm
+
+    star_flux_corr = star_flux * psf_norm
+
+    # TODO: Automatic computation of PSF normalization
+    # TODO: Automatic choice of bands to use
+
+    # Convert PS1 magnitude to flux, where 20th mag corresponds to a flux of 1
+    ps1_flux = 10.**(-(star_ps1_mag-20.) / 2.5)
+
+    # The model is that the fitted flux is a linear combination of the fluxes
+    # in the PS1 bands, plus a zero point flux. The design matrix is therefore
+    # given by
+    #
+    #   A = [[1 g_0 r_0 i_0 z_0 y_0],
+    #        [1 g_1 r_1 i_1 z_1 y_1],
+    #                  ...
+    #        [1 g_n r_n i_n z_n y_n]] ,
+    #
+    # where n is the number of stars, while the parameter matrix is given by
+    #
+    #   x = [f_zp c_g c_r c_i c_z c_y] ,
+    #
+    # and the data matrix is given by
+    #
+    #   b = [f_0 f_1 ... f_n] ,
+    #
+    # where f_k is the flux of star k.
+
+    n_stars = star_flux.size
+
+    A = np.empty((n_stars, 6), dtype='f8')
+    A[:,0] = 1.
+    A[:,1:] = ps1_flux[:]
+
+    # Use only stars with 5-band photometry
+    idx_good = np.all((star_ps1_mag > 1.) & (star_ps1_mag < 26.), axis=1)
+    idx_good &= np.isfinite(star_flux)
+
+    print idx_good
+    print '# of good stars: {}'.format(np.sum(idx_good))
+
+    A = A[idx_good]
+    b = star_flux_corr[idx_good]
+
+    # Set errors in fitted fluxes at 5%
+    #sigma = b * 0.05
+    #sqrt_w = 1. / sigma
+    #A *= sqrt_w[:,None]
+    #b *= sqrt_w[:]
+
+    # Remove NaN and Inf values
+    A[~np.isfinite(A)] = 0.
+    b[~np.isfinite(b)] = 0.
+
+    # Execute least squares
+    coeffs = np.linalg.lstsq(A, b)[0]
+    zp = coeffs[0]
+    c = coeffs[1:]
+
+    print 'Flux fit coefficients:'
+    print coeffs
+    print ''
+
+    def PS1_mag_to_fit_flux(m_p1):
+        f_p1 = 10.**(-(m_p1-20.) / 2.5)
+        return zp + np.einsum('k,jk->j', c, f_p1)
+
+    print star_ps1_mag[idx_good][:3]
+    f_resid = (PS1_mag_to_fit_flux(star_ps1_mag[idx_good]) - star_flux_corr[idx_good]) / star_flux_corr[idx_good]
+
+    print 'Residuals:'
+    print f_resid
+    print 'Residual percentiles:'
+    pctiles = [1., 5., 10., 20., 50., 80., 90., 95., 99.]
+    for p,r in zip(pctiles, np.percentile(f_resid, pctiles)):
+        print '  {: 2d} -> {:.3f}'.format(int(p), r)
+    print ''
+
+    return PS1_mag_to_fit_flux
 
 
 def filter_close_points(x, y, r):
@@ -154,7 +289,8 @@ def eval_psf(psf_coeffs, star_x, star_y, ccd_shape):
 
 def fit_star_params(psf_coeffs, star_x, star_y,
                     ps_exposure, ps_weight, ps_mask, ccd_shape,
-                    sky_mean=0., sky_sigma=0.5):
+                    sky_mean=0., sky_sigma=0.5,
+                    stellar_flux_mean=0., stellar_flux_sigma=np.inf):
     '''
     Fit stellar flux and sky brightness, given a PSF model.
     '''
@@ -164,9 +300,15 @@ def fit_star_params(psf_coeffs, star_x, star_y,
     #psf_val /= np.sum(psf_val)
     psf_val.shape = (psf_val.size,)
 
+    # Normalize the stellar flux priors
+    psf_norm = np.sum(psf_val)
+    stellar_flux_mean = stellar_flux_mean / psf_norm
+    stellar_flux_sigma = stellar_flux_sigma / psf_norm
+    print 'stellar flux prior: {:.5f} +- {:.5f}'.format(stellar_flux_mean, stellar_flux_sigma)
+
     # Calculate the square root of the weight
     sqrt_w = np.sqrt(ps_weight.flat)
-    #sqrt_w[:] = 1.
+    #sqrt_w = np.ones(ps_weight.size, dtype='f8')
     sqrt_w[ps_mask.flat != 0] = 0.
 
     # The linear least squares design and data matrices
@@ -175,13 +317,23 @@ def fit_star_params(psf_coeffs, star_x, star_y,
 
     # Extend the design and data matrices to incorporate priors
     A_priors = np.array([
-        [0., 1./sky_sigma]  # Prior on sky level
+        [1./stellar_flux_sigma, 0.], # Prior on stellar flux
+        [0., 1./sky_sigma]           # Prior on sky level
     ])
     b_priors = np.array([
-        sky_mean/sky_sigma  # Prior on sky level
+        stellar_flux_mean/stellar_flux_sigma, # Prior on stellar flux
+        sky_mean/sky_sigma                    # Prior on sky level
     ])
     A = np.vstack([A, A_priors])
     b = np.hstack([b, b_priors])
+
+    print ''
+    print 'A:'
+    print A
+    print ''
+    print 'b:'
+    print b
+    print ''
 
     # Remove NaN and Inf values
     A[~np.isfinite(A)] = 0.
@@ -226,6 +378,12 @@ def fit_psf_coeffs(star_flux, star_sky,
     # Data matrix
     b = np.zeros(n_stars+6, dtype='f8')
 
+    # Remove masked pixels
+    mask_pix = np.where(ps_mask != 0)[0]
+    A_base[mask_pix] = 0.
+
+    print '# of masked pixels: {}'.format(mask_pix.size)
+
     # Priors
     A_base[-6:,:] = np.diag(np.ones(6, dtype='f8'))
 
@@ -237,15 +395,12 @@ def fit_psf_coeffs(star_flux, star_sky,
             # Design matrix
             A[:] = A_base[:]
             #A[:n_stars,:] *= sqrt_w[:,None,j,k]
-            A[-6] *= 0.
-            A[-5:] *= 1. / np.sqrt(sigma_nonzero_order)
-
-            #print ''
-            #print A[-6:]
-            #print ''
+            A[-6] *= 0. # Prior on the zeroeth-order term
+            A[-5:] *= 1 / sigma_nonzero_order # Prior on higher-order terms
 
             # Data matrix
-            b[:n_stars] = img_zeroed[:,j,k] * star_flux[:] #* sqrt_w[:n_stars,j,k]
+            b[:n_stars] = img_zeroed[:,j,k] * star_flux[:]# * sqrt_w[:n_stars,j,k]
+            b[mask_pix] = 0.
 
             # Remove NaN and Inf values
             A[~np.isfinite(A)] = 0.
@@ -387,6 +542,11 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
 
         if np.all(~idx_use):
             continue
+
+        # Find non-center pixels
+        #s = idx_use.shape
+        #idx_noncenter = np.ones(s, dtype=np.bool)
+        #idx_noncenter[s[0]/4:3*s[0]/4, s[1]/4:int(3./4.*s[1])]
 
         # Copy star into postage stamp stack
         ps_stack[0,i,dj0:dj1,dk0:dk1] = tmp_exposure - np.median(tmp_exposure[idx_use])
@@ -652,6 +812,10 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     star_y = star_y[idx]
     star_ps1_mag = star_ps1_mag[idx]
 
+    # Find indices of stars with no masking at all
+    idx_unmasked = filter_postage_stamps(ps_mask, min_pixel_fraction=0.99999)
+    print '{} completely unmasked stars.'.format(np.sum(idx_unmasked))
+
     # Guess the PSF by median-stacking pristine postage stamps (no masked pixels)
     psf_guess = guess_psf(ps_exposure, ps_weight, ps_mask)
 
@@ -661,27 +825,57 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     psf_coeffs[0,:,:] = psf_guess[:,:]
     stellar_flux = np.empty(n_stars, dtype='f8')
     sky_level = np.empty(n_stars, dtype='f8')
+    stellar_flux[:] = np.nan
+    sky_level[:] = np.nan
+
+    # Fit a 2D Gaussian to the PSF guess, to be used as a prior on the
+    # zeroeth-order PSF coefficients.
+    #gauss_psf_prior = fit_2d_gaussian(psf_coeffs[0,:,:])
+    #print gauss_psf_prior
+
+    stellar_flux_mean = np.zeros(n_stars, dtype='f8')
+    stellar_flux_sigma = np.empty(n_stars, dtype='f8')
+    stellar_flux_sigma[:] = np.inf
 
     for j in range(n_iter):
         # Fit the flux and local sky level for each star
         for k in range(n_stars):
-            stellar_flux[k], sky_level[k] = fit_star_params(psf_coeffs,
-                                                            star_x[k], star_y[k],
-                                                            ps_exposure[k], ps_weight[k],
-                                                            ps_mask[k], ccd_shape)
+            stellar_flux[k], sky_level[k] = fit_star_params(
+                psf_coeffs,
+                star_x[k], star_y[k],
+                ps_exposure[k], ps_weight[k],
+                ps_mask[k], ccd_shape,
+                sky_sigma=0.05,
+                stellar_flux_mean=stellar_flux_mean[k],
+                stellar_flux_sigma=stellar_flux_sigma[k]
+            )
 
         # Flag stars with bad chi^2/dof
         star_chisq = calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
                                      star_x, star_y, stellar_flux, sky_level,
                                      ccd_shape)
-        idx = (star_chisq < star_chisq_threshold)
+        idx_chisq = (star_chisq < star_chisq_threshold)
 
         print 'Rejected stars:'
-        print np.where(~idx)[0]
+        print np.where(~idx_chisq)[0]
 
-        print 'Rejected {} of {} stars.'.format(np.sum(~idx), idx.size)
+        print 'Rejected {} of {} stars.'.format(np.sum(~idx_chisq), idx_chisq.size)
+
+        # Update the prior on stellar flux
+        idx = idx_chisq & idx_unmasked
+        flux_predictor = gen_stellar_flux_predictor(
+            stellar_flux[idx], star_ps1_mag[idx],
+            star_x[idx], star_y[idx],
+            ccd_shape, psf_coeffs
+        )
+        stellar_flux_mean[:] = flux_predictor(star_ps1_mag)
+        stellar_flux_sigma[:] = 0.0001 * np.sqrt(stellar_flux_mean)
 
         # Fit the PSF coefficients in each pixel
+        if j == 0:
+            idx = idx_chisq & idx_unmasked
+        else:
+            idx = idx_chisq
         psf_coeffs = fit_psf_coeffs(stellar_flux[idx], sky_level[idx],
                                     star_x[idx], star_y[idx],
                                     ccd_shape, ps_exposure[idx],
@@ -690,12 +884,23 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
         # Normalize the PSF
         psf_coeffs = normalize_psf_coeffs(psf_coeffs)
 
+        # Update the 2D Gaussian (which is a prior on the zeroeth-order
+        # PSF coefficients)
+        #gauss_psf_prior = fit_2d_gaussian(psf_coeffs[0,:,:])
+        #print gauss_psf_prior
+
+
     if return_postage_stamps:
         for k in range(n_stars):
-            stellar_flux[k], sky_level[k] = fit_star_params(psf_coeffs,
-                                                            star_x[k], star_y[k],
-                                                            ps_exposure[k], ps_weight[k],
-                                                            ps_mask[k], ccd_shape)
+            stellar_flux[k], sky_level[k] = fit_star_params(
+                psf_coeffs,
+                star_x[k], star_y[k],
+                ps_exposure[k], ps_weight[k],
+                ps_mask[k], ccd_shape,
+                sky_sigma=0.05,
+                stellar_flux_mean=stellar_flux_mean[k],
+                stellar_flux_sigma=stellar_flux_sigma[k]
+            )
 
         star_dict = {
             'ps_exposure':  ps_exposure,
@@ -955,32 +1160,21 @@ def test_extract_psf():
     img_data, weight_data, mask_data, wcs = load_exposure(fname_pattern, 'S31')
     ccd_shape = img_data.shape
 
-    print 'Weight percentiles:'
-    print np.percentile(weight_data[np.isfinite(weight_data) & (mask_data == 0)], [0.1, 1., 5., 50., 95., 99., 99.9])
-    print ''
-
     # Extract the PSF
     psf_coeffs, star_dict = extract_psf(img_data, weight_data, mask_data, wcs,
-                                        return_postage_stamps=True, n_iter=2,
-                                        min_pixel_fraction=0.999)
+                                        return_postage_stamps=True, n_iter=5,
+                                        min_pixel_fraction=0.75,
+                                        star_chisq_threshold=2.)
 
     n_stars = star_dict['ps_exposure'].shape[0]
     ccd_shape = img_data.shape
 
-    # Calculate centers of mass
-    #print 'Centers of mass:'
+    #m_tmp = np.arange(14., 20.1, 1.)
+    #f_tmp = flux_predictor(m_tmp)
 
-    #com_xy = []
-    #com_filt_xy = []
-
-    #width = int(np.round((star_dict['ps_exposure'].shape[1] - 1.) / 2.))
-    #w_cent = gen_centered_weights(star_dict['ps_exposure'].shape[1:], 1.)
-
-    #for ps_img, ps_mask in zip(star_dict['ps_exposure'], star_dict['ps_mask']):
-    #    com_xy.append(img_center_of_mass(ps_img, ps_mask))
-    #    com_filt_xy.append(img_center_of_mass(ps_img*w_cent, ps_mask))
-    #    print com_xy[-1], com_filt_xy[-1]
-
+    #print ''
+    #for m,f in zip(m_tmp, f_tmp):
+    #    print 'f({:d}) = {.5f}'.format(m, f)
     #print ''
 
     # Calculate the residuals
@@ -1014,12 +1208,35 @@ def test_extract_psf():
     mag_offset = np.median(fit_mag[idx_ps1_good] - star_dict['star_ps1_mag'][idx_ps1_good,3])
     flux_scaling = np.median(fit_flux[idx_ps1_good] / ps1_flux[idx_ps1_good,3])
 
+    # Relation between PS1 flux and fitted flux
+    flux_predictor = gen_stellar_flux_predictor(star_dict['stellar_flux'],
+                                                star_dict['star_ps1_mag'],
+                                                star_dict['star_x'],
+                                                star_dict['star_y'],
+                                                ccd_shape,
+                                                psf_coeffs)
+
     print 'Magnitude offset: {}'.format(mag_offset)
     print 'Flux scaling: {}'.format(flux_scaling)
 
     ax = fig.add_subplot(1,2,1)
+
     ax.scatter(ps1_flux[idx_ps1_good,3], fit_flux[idx_ps1_good],
                edgecolor='none', facecolor='r', s=10)
+
+
+    idx = np.all((star_dict['star_ps1_mag'] > 1.) & (star_dict['star_ps1_mag'] < 26.), axis=1)
+    f_tmp = ps1_flux[idx]
+    m_tmp = star_dict['star_ps1_mag'][idx]
+    print m_tmp[:3]
+
+    print 'resid:'
+    print (flux_predictor(m_tmp) - fit_flux[idx]) / fit_flux[idx]
+    print ''
+
+    ax.scatter(f_tmp[:,3], flux_predictor(m_tmp),
+               edgecolor='none', facecolor='g', s=10, alpha=0.5)
+
     ax.set_xlabel(r'$f_{\mathrm{P1}}$', fontsize=18)
     ax.set_ylabel(r'$f_{\mathrm{fit}}$', fontsize=18)
     ax.set_title(r'$\mathrm{Fit \ vs. \ PS1 \ Flux}$', fontsize=20)
@@ -1082,26 +1299,28 @@ def test_extract_psf():
     plt.close(fig)
 
     # Plot the PSF across the CCD
-    fig = plt.figure(figsize=(12,12), dpi=120)
+    for vmax in [1., 0.1, 0.01, 0.001]:
+        fig = plt.figure(figsize=(12,12), dpi=120)
 
-    for j,x in enumerate(np.linspace(0, ccd_shape[0], 3)):
-        for k,y in enumerate(np.linspace(0, ccd_shape[1], 3)):
-            tmp = eval_psf(psf_coeffs, x, y, ccd_shape)
-            tmp /= np.max(np.abs(tmp))
+        for j,x in enumerate(np.linspace(0, ccd_shape[0], 3)):
+            for k,y in enumerate(np.linspace(0, ccd_shape[1], 3)):
+                tmp = eval_psf(psf_coeffs, x, y, ccd_shape)
+                tmp /= np.max(np.abs(tmp))
 
-            ax = fig.add_subplot(3,3,3*k+j+1)
+                ax = fig.add_subplot(3,3,3*k+j+1)
 
-            ax.imshow(tmp.T, origin='upper', aspect='equal',
-                      interpolation='nearest', cmap='bwr_r',
-                      vmin=-1., vmax=1.)
+                ax.imshow(tmp.T, origin='upper', aspect='equal',
+                          interpolation='nearest', cmap='bwr_r',
+                          vmin=-vmax, vmax=vmax)
 
-            ax.set_xticks([])
-            ax.set_yticks([])
+                ax.set_xticks([])
+                ax.set_yticks([])
 
-    fig.subplots_adjust(wspace=0.01, hspace=0.01)
+        fig.subplots_adjust(wspace=0.01, hspace=0.01)
 
-    fig.savefig('psf_over_ccd.png', dpi=120, bbox_inches='tight')
-    plt.close(fig)
+        fig.savefig('psf_over_ccd_{:.3f}.png'.format(vmax),
+                    dpi=120, bbox_inches='tight')
+        plt.close(fig)
 
     # Plot postage stamps of the stars
     ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
