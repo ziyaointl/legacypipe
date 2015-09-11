@@ -3,6 +3,8 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 
+from psf_extraction import *
+
 
 def test_sinc_shift_image():
     from PIL import Image
@@ -232,6 +234,20 @@ def test_extract_psf():
                                 star_dict['stellar_flux'], star_dict['sky_level'],
                                 ccd_shape)
 
+    # Calculate the shift for each star
+    print 'Fitting star offsets:'
+    for k in range(len(star_dict['ps_exposure'])):
+        print 'Star {: 3d}'.format(k)
+        print '========\n'
+
+        dx,dy = fit_star_offset(psf_coeffs, star_dict['ps_exposure'][k],
+                                star_dict['ps_weight'][k], star_dict['ps_mask'][k],
+                                star_dict['star_x'][k], star_dict['star_y'][k],
+                                star_dict['stellar_flux'][k], star_dict['sky_level'][k],
+                                ccd_shape, max_shift=5.)
+
+        print 'dx,dy = ({:.3f}, {:.3f})\n\n'.format(dx, dy)
+
     # Calculate corrections to fluxes, by normalizing PSFs
     psf_norm = np.empty(n_stars, dtype='f8')
 
@@ -368,6 +384,32 @@ def test_extract_psf():
                     dpi=120, bbox_inches='tight')
         plt.close(fig)
 
+    # Plot the central PSF shifted by different amounts
+    psf_img = eval_psf(psf_coeffs, 0.5, 0.5, (1.,1.))
+    psf_img /= np.max(psf_img)
+
+    for vmax in [1., 0.1, 0.01, 0.001]:
+        fig = plt.figure(figsize=(12,12), dpi=120)
+
+        for j,dx in enumerate(np.linspace(-5., 5., 3)):
+            for k,dy in enumerate(np.linspace(-5., 5., 3)):
+                tmp = sinc_shift_image(psf_img, dx, dy)#, roll_int=False)
+
+                ax = fig.add_subplot(3,3,3*k+j+1)
+
+                ax.imshow(tmp.T, origin='upper', aspect='equal',
+                          interpolation='nearest', cmap='bwr_r',
+                          vmin=-vmax, vmax=vmax)
+
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+        fig.subplots_adjust(wspace=0.01, hspace=0.01)
+
+        fig.savefig('psf_shifted_{:.3f}.png'.format(vmax),
+                    dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
     # Plot postage stamps of the stars
     ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
     ps_y_cent = 0.5 * float(star_dict['ps_exposure'].shape[2]-1.)
@@ -424,8 +466,6 @@ def test_extract_psf():
         if np.any(idx):
             #vmin, vmax = np.percentile(tmp[idx], [1., 99.8])
             vmin, vmax = np.min(tmp[idx]), np.max(tmp[idx])
-
-        print 'star {:2d}: ({:.5f}, {:.5f})'.format(k, vmin, vmax)
 
         ax = fig.add_subplot(n_x, n_y, k+1, axisbg='g')
 
