@@ -124,7 +124,7 @@ def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
     return ret
 
 
-def sinc_shift_image(img, dx, dy):
+def sinc_shift_image(img, dx, dy, roll_int=True):
     '''
     Shift a real-valued image by (dx,dy), using the DFT shift theorem.
 
@@ -137,9 +137,87 @@ def sinc_shift_image(img, dx, dy):
       A shifted copy of the image, as a 2D numpy array.
     '''
 
+    # Roll the image first by the nearest integer amount
+    if roll_int:
+        dx_int = int(np.around(dx))
+        dy_int = int(np.around(dy))
+
+        dx = dx - dx_int
+        dy = dy - dy_int
+
+        img = np.roll(img, dx_int, axis=0)
+        img = np.roll(img, dy_int, axis=1)
+
+    # Use a sinc-shift for the rest of the shift
     img_dft = np.fft.fft2(img)
     img_dft = scipy.ndimage.fourier.fourier_shift(img_dft, (dx,dy))
+
     return np.real(np.fft.ifft2(img_dft))
+
+
+def fit_star_offset(psf_coeffs, ps_exposure, ps_weight, ps_mask,
+                    star_x, star_y, star_flux, sky_level, ccd_shape,
+                    max_shift=5.):
+    #print psf_coeffs.shape
+    #print star_x.shape
+
+    # Calculate the local psf (if the shifts are small, this is constant)
+    psf_img = eval_psf(psf_coeffs, star_x, star_y, ccd_shape)
+    psf_img /= np.sum(psf_img)
+
+    # Calculate the model image of the star
+    star_model_img = psf_img * star_flux + sky_level
+
+    # For constrained optimization, fit in a transformed parameter space. The
+    # transformed parameter is given by
+    #   x' = Dx * tan(pi/2 * x/x_max),
+    # where Dx is a scale parameter. This is done so that for x' in (-inf, inf),
+    # x is in (-x_max, x_max).
+
+    Dx = 0.5 * max_shift
+
+    # x' -> x
+    def xp2x(xp):
+        return max_shift * 2./np.pi * np.arctan(xp / Dx)
+
+    # x -> x'
+    def x2xp(x):
+        return Dx * np.tan(0.5*np.pi * x / max_shift)
+
+    # The objective function to be minimized:
+    # chi^2/dof for arbitrary shift of star model image
+    def f_obj(dxy_p):
+        # Go from transformed parameter values to actual values
+        dx, dy = xp2x(dxy_p)
+
+        # Shift the model image of the star (negative b/c we're shifting the
+        # model, rather than the actual image of the star)
+        model_shifted = sinc_shift_image(star_model_img, dx, dy)
+
+        # chi^2/dof vs. actual image of star
+        resid = ps_exposure - model_shifted
+        resid *= resid * ps_weight
+        resid[(ps_mask != 0) | ~np.isfinite(resid)] = 0.
+        chisq_dof = np.sum(np.sum(resid, axis=0), axis=0)
+        chisq_dof /= float(ps_exposure.shape[0] * ps_exposure.shape[1])
+
+        # Add a penalty for wandering very far off
+        chisq_dof += 0.1 * np.sum(dxy_p**2.) / Dx**2.
+
+        #print dx, dy, chisq_dof
+
+        return chisq_dof
+
+    # Minimize chi^2/dof by shifting the model image of the star
+    # TODO: Test other algorithms, like 'BFGS', and see why some stars only use one iteration.
+    x0 = np.array([0.,0.])
+    res = scipy.optimize.minimize(f_obj, x0, method='nelder-mead',
+                                  options={'xtol': 1.e-3, 'disp': True, 'maxiter': 250})
+
+    # Transform the result from primed to unprimed coordinates
+    dx_opt, dy_opt = xp2x(res.x)
+
+    return dx_opt, dy_opt
 
 
 def gen_stellar_flux_predictor(star_flux, star_ps1_mag,
@@ -714,7 +792,11 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     psf_resid *= psf_resid * ps_weight
     psf_resid[(ps_mask != 0) | ~np.isfinite(psf_resid)] = 0.
     psf_resid = np.sum(np.sum(psf_resid, axis=1), axis=1)
-    psf_resid /= float(ps_exposure.shape[1] * ps_exposure.shape[2])
+
+    print (ps_mask == 0).shape
+    n_pix = np.sum(np.sum((ps_mask == 0).astype('f8'), axis=1), axis=1)
+
+    psf_resid /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
 
     return psf_resid
 
@@ -836,6 +918,9 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     stellar_flux_sigma = np.empty(n_stars, dtype='f8')
     stellar_flux_sigma[:] = np.inf
 
+    star_dx = np.zeros(n_stars, dtype='f8')
+    star_dy = np.zeros(n_stars, dtype='f8')
+
     for j in range(n_iter):
         # Fit the flux and local sky level for each star
         for k in range(n_stars):
@@ -875,6 +960,7 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
             idx = idx_chisq & idx_unmasked
         else:
             idx = idx_chisq
+
         psf_coeffs = fit_psf_coeffs(stellar_flux[idx], sky_level[idx],
                                     star_x[idx], star_y[idx],
                                     ccd_shape, ps_exposure[idx],
@@ -883,10 +969,33 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
         # Normalize the PSF
         psf_coeffs = normalize_psf_coeffs(psf_coeffs)
 
-        # Update the 2D Gaussian (which is a prior on the zeroeth-order
-        # PSF coefficients)
-        #gauss_psf_prior = fit_2d_gaussian(psf_coeffs[0,:,:])
-        #print gauss_psf_prior
+        if j > 1:
+            # Recenter stars
+            for k in range(n_stars):
+                star_dx[k], star_dy[k] = fit_star_offset(
+                    psf_coeffs,
+                    ps_exposure[k],
+                    ps_weight[k],
+                    ps_mask[k],
+                    star_x[k],
+                    star_y[k],
+                    stellar_flux[k],
+                    sky_level[k],
+                    ccd_shape,
+                    max_shift=2.
+                ) # TODO: include max_shift as option
+
+            star_x += star_dx
+            star_y += star_dy
+
+            # Re-extract stars, with new shifts
+            ps_exposure, ps_weight, ps_mask = extract_stars(
+                exposure_img, weight_img,
+                mask_img, star_x, star_y,
+                width=psf_halfwidth,
+                buffer_width=buffer_width,
+                avoid_edges=avoid_edges
+            )
 
 
     if return_postage_stamps:
