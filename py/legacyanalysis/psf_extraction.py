@@ -12,6 +12,11 @@ import warnings
 
 from sklearn.neighbors import NearestNeighbors
 
+try:
+    import astropy.io.fits as pyfits
+except ImportError:
+    import pyfits
+
 
 def fit_2d_gaussian(img):
     '''
@@ -54,6 +59,7 @@ def fit_2d_gaussian(img):
 
 def img_center_of_mass(img, img_mask):
     '''
+    Find the center of mass of an image.
     '''
 
     idx = ~np.isfinite(img) | (img_mask != 0) # Determine image mask
@@ -235,7 +241,7 @@ def gen_stellar_flux_predictor(star_flux, star_ps1_mag,
         psf_model = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
         psf_norm[k] = np.sum(psf_model)
 
-    print 'PSF Norm:', psf_norm
+    #print 'PSF Norm:', psf_norm
 
     star_flux_corr = star_flux * psf_norm
 
@@ -432,7 +438,7 @@ def fit_psf_coeffs(star_flux, star_sky,
     x = star_x / float(ccd_shape[0])
     y = star_y / float(ccd_shape[1])
 
-    # Normalize counts (by removing sky background and dividing out stellar flux)
+    # Subtract each star's sky level from its postage stamp
     img_zeroed = ps_exposure - star_sky[:,None,None]
     img_zeroed[ps_mask != 0] = 0.
 
@@ -560,8 +566,8 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
 
     # Determine amount to shift each star to center it on a pixel
     x_floor, y_floor = np.floor(star_x).astype('i4'), np.floor(star_y).astype('i4')
-    dx = -(star_x - x_floor - 0.5)
-    dy = -(star_y - y_floor - 0.5)
+    dx = -(star_x - x_floor)
+    dy = -(star_y - y_floor)
 
     # For each star, determine rectangle to copy from
     # the exposure (the "source" image), and the rectangle
@@ -634,7 +640,7 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
         ps_stack[1,i] = sinc_shift_image(ps_stack[1,i], dx[i], dy[i])
 
         ps_stack[2,i,dj0:dj1,dk0:dk1] = tmp_mask
-        ps_stack[2,i] = astropy.convolution.convolve(ps_stack[2,i], kern, boundary='extend')#white_tophat(ps_stack[2,i], size=3, mode='nearest')
+        ps_stack[2,i] = astropy.convolution.convolve(ps_stack[2,i], kern, boundary='extend')
 
     # Clip edge pixels off of postage stamps and return result
     return ps_stack[:, :, buffer_width:w_ps-buffer_width, buffer_width:w_ps-buffer_width]
@@ -752,7 +758,8 @@ def get_ps1_stars_for_ccd(wcs, ccd_shape, min_separation):
 
 
 def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
-                    star_x, star_y, star_flux, sky_level, ccd_shape):
+                    star_x, star_y, star_flux, sky_level, ccd_shape,
+                    return_chisq_img=False):
     '''
     Calculate the mean squared deviation of each postage stamp's pixels from the
     modeled flux (based on the PSF model, fitted stellar flux and sky level),
@@ -769,11 +776,16 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
       sky_level
       ccd_shape
 
+    Optional parameters:
+      return_chisq_img  If true, a stack of images showing chi^2 per pixel is
+                        returned. Default: False.
+
     Outputs:
       psf_resid  Mean squared weighted residuals between the postage stamps and
                  the modeled flux.
     '''
 
+    # Generate an image of the PSF at the location of each star
     x = star_x / float(ccd_shape[0])
     y = star_y / float(ccd_shape[1])
 
@@ -785,26 +797,31 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     psf_img += psf_coeffs[4,None,:,:] * y[:,None,None] * y[:,None,None]
     psf_img += psf_coeffs[5,None,:,:] * x[:,None,None] * y[:,None,None]
 
+    # Transform the PSF into a model of counts
     psf_img *= star_flux[:,None,None]
     psf_img += sky_level[:,None,None]
 
-    psf_resid = psf_img - ps_exposure
-    psf_resid *= psf_resid * ps_weight
-    psf_resid[(ps_mask != 0) | ~np.isfinite(psf_resid)] = 0.
-    psf_resid = np.sum(np.sum(psf_resid, axis=1), axis=1)
+    # Calculate an image of chi^2 of each star
+    chisq_img = ps_exposure - psf_img
+    chisq_img *= chisq_img * ps_weight
+    chisq_img[(ps_mask != 0) | ~np.isfinite(chisq_img)] = 0.
 
-    print (ps_mask == 0).shape
+    # Calculate chi^2/dof for each star
+    chisq = np.sum(np.sum(chisq_img, axis=1), axis=1)
     n_pix = np.sum(np.sum((ps_mask == 0).astype('f8'), axis=1), axis=1)
+    chisq /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
 
-    psf_resid /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
+    if return_chisq_img:
+        return chisq, chisq_img
 
-    return psf_resid
+    return chisq
 
 
 def extract_psf(exposure_img, weight_img, mask_img, wcs,
                 min_separation=50., min_pixel_fraction=0.5, n_iter=1,
                 psf_halfwidth=31, buffer_width=10, avoid_edges=1,
                 star_chisq_threshold=2., max_star_shift=3.,
+                pixel_chisq_threshold=10.**2.,
                 return_postage_stamps=False):
     '''
     Extract the PSF from a CCD exposure, using a pixel basis. Each pixel is
@@ -921,6 +938,10 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     star_dx = np.zeros(n_stars, dtype='f8')
     star_dy = np.zeros(n_stars, dtype='f8')
 
+    ps_mask_effective = None
+    ps_chisq_mask = None
+
+    # Iterate linear fits to reach the solution
     for j in range(n_iter):
         # Fit the flux and local sky level for each star
         for k in range(n_stars):
@@ -935,10 +956,25 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
             )
 
         # Flag stars with bad chi^2/dof
-        star_chisq = calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
-                                     star_x, star_y, stellar_flux, sky_level,
-                                     ccd_shape)
+        star_chisq, star_chisq_img = calc_star_chisq(
+            psf_coeffs,
+            ps_exposure, ps_weight, ps_mask,
+            star_x, star_y,
+            stellar_flux, sky_level,
+            ccd_shape,
+            return_chisq_img=True
+        )
         idx_chisq = (star_chisq < star_chisq_threshold)
+
+        # Flag pixels with bad chi^2/dof
+        ps_chisq_mask = (np.abs(star_chisq_img) > star_chisq_threshold).astype('f8')
+        print '{:.2f} % of pixels masked'.format(np.sum(ps_chisq_mask) / float(ps_chisq_mask.size))
+        kern = astropy.convolution.Box2DKernel(3)
+        #for k in range(n_stars):
+        #    ps_chisq_mask[k] = astropy.convolution.convolve(ps_chisq_mask[k], kern,
+        #                                                    boundary='extend')
+        ps_chisq_mask = (ps_chisq_mask < 0.1)
+        print '{:.2f} % of pixels masked'.format(np.sum(ps_chisq_mask) / float(ps_chisq_mask.size))
 
         print 'Rejected stars:'
         print np.where(~idx_chisq)[0]
@@ -961,10 +997,15 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
         else:
             idx = idx_chisq
 
+        if j > 100:
+            ps_mask_effective = ((ps_mask[idx] != 0) | (ps_chisq_mask[idx] > 0.1)).astype('f8')
+        else:
+            ps_mask_effective = ps_mask[idx]
+
         psf_coeffs = fit_psf_coeffs(stellar_flux[idx], sky_level[idx],
                                     star_x[idx], star_y[idx],
                                     ccd_shape, ps_exposure[idx],
-                                    ps_weight[idx], ps_mask[idx])
+                                    ps_weight[idx], ps_mask_effective)
 
         # Normalize the PSF
         psf_coeffs = normalize_psf_coeffs(psf_coeffs)
@@ -1011,14 +1052,15 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
             )
 
         star_dict = {
-            'ps_exposure':  ps_exposure,
-            'ps_weight':    ps_weight,
-            'ps_mask':      ps_mask,
-            'star_x':       star_x,
-            'star_y':       star_y,
-            'star_ps1_mag': star_ps1_mag,
-            'stellar_flux': stellar_flux,
-            'sky_level':    sky_level
+            'ps_exposure':   ps_exposure,
+            'ps_weight':     ps_weight,
+            'ps_mask':       ps_mask,
+            'ps_chisq_mask': ps_chisq_mask,
+            'star_x':        star_x,
+            'star_y':        star_y,
+            'star_ps1_mag':  star_ps1_mag,
+            'stellar_flux':  stellar_flux,
+            'sky_level':     sky_level
         }
 
         return psf_coeffs, star_dict
@@ -1041,18 +1083,59 @@ def load_exposure(fname_pattern, ccd_id):
       weight_data  Weight image
       mask_data    Mask image
       wcs          The WCS astrometric solution
+      exp_num      The exposure number
     '''
 
-    img_data, img_header = astropy.io.fits.getdata(fname_pattern.format('i'),
-                                                   ccd_id, header=True)
+    hdulist = pyfits.open(fname_pattern.format('i'))
+    exp_num = hdulist[0].header['EXPNUM']
+
+    #primary_data, primary_header = pyfits.getdata(fname_pattern.format('i'), 0,
+    #                                              header=True)
+    #print primary_header.keys()
+    #exp_num = primary_header['EXPNUM']
+    img_data = hdulist[ccd_id].data[:]
+    img_header = hdulist[ccd_id].header
+
+    #img_data, img_header = pyfits.getdata(fname_pattern.format('i'),
+    #                                      ccd_id, header=True)
     wcs = astropy.wcs.WCS(header=img_header)
 
-    weight_data = astropy.io.fits.getdata(fname_pattern.format('w'), ccd_id)
-    mask_data = astropy.io.fits.getdata(fname_pattern.format('d'), ccd_id)
+    weight_data = pyfits.getdata(fname_pattern.format('w'), ccd_id)
+    mask_data = pyfits.getdata(fname_pattern.format('d'), ccd_id)
+    mask_data[:] = 0.
+
+    # Fix the weights
+    weight_data[weight_data < 0.] = 0.
 
     # Apply the mask to the weights (and zero out the corresponding image pixels)
     #mask_idx = (mask_data != 0)
     #img_data[mask_idx] = 0.
     #weight_data[mask_idx] = 0.
 
-    return img_data, weight_data, mask_data, wcs
+    return img_data, weight_data, mask_data, wcs, exp_num
+
+
+def write_psf_file(fname, psf_coeffs, ccd_shape, ccd_name, exp_num):
+    '''
+    Write the PSF coefficients to a FITS file.
+    '''
+
+    primary = pyfits.PrimaryHDU()
+    primary.header['PSFTYPE'] = 'PCA-PIX'
+    primary.header['YSCALE'] = 1. / float(ccd_shape[0])
+    primary.header['XSCALE'] = 1. / float(ccd_shape[1])
+    primary.header['NPIX_Y'] = ccd_shape[0]
+    primary.header['NPIX_X'] = ccd_shape[1]
+    primary.header['EXPNUM'] = exp_num
+
+    hdu1 = pyfits.TableHDU.from_columns([
+        pyfits.Column(name='IMODEL', format='J', array=range(6)),
+        pyfits.Column(name='YEXP', format='J', array=[0,1,0,2,0,1]),
+        pyfits.Column(name='XEXP', format='J', array=[0,0,1,0,2,1])
+    ])
+
+    hdu2 = pyfits.ImageHDU(data=psf_coeffs, name=ccd_name)
+    hdu2.header['CCD'] = ccd_name
+
+    hdulist = pyfits.HDUList([primary, hdu1, hdu2])
+    hdulist.writeto(fname, clobber=True, checksum=True)
