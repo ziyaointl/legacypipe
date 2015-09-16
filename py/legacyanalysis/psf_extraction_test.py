@@ -319,8 +319,10 @@ def test_filter_neighbors():
 
 def test_extract_psf():
     # Load a test image
-    fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
-    img_data, weight_data, mask_data, wcs = load_exposure(fname_pattern, 'S31')
+    #fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    fname_pattern = 'psfunit/detest-00396086-S31-oo{}.fits.fz'
+    ccd_id = 'S31'
+    img_data, weight_data, mask_data, wcs, exp_num = load_exposure(fname_pattern, ccd_id)
     ccd_shape = img_data.shape
 
     # Extract the PSF
@@ -331,6 +333,10 @@ def test_extract_psf():
 
     n_stars = star_dict['ps_exposure'].shape[0]
     ccd_shape = img_data.shape
+
+    # Write the PSF to a file
+    psf_fname = 'decam-{:08d}-{}.fits'.format(exp_num, ccd_id)
+    write_psf_file(psf_fname, psf_coeffs, ccd_shape, ccd_id, exp_num)
 
     #m_tmp = np.arange(14., 20.1, 1.)
     #f_tmp = flux_predictor(m_tmp)
@@ -346,6 +352,20 @@ def test_extract_psf():
                                 star_dict['star_x'], star_dict['star_y'],
                                 star_dict['stellar_flux'], star_dict['sky_level'],
                                 ccd_shape)
+
+    # Calculate the shift for each star
+    print 'Fitting star offsets:'
+    for k in range(len(star_dict['ps_exposure'])):
+        print 'Star {: 3d}'.format(k)
+        print '========\n'
+
+        dx,dy = fit_star_offset(psf_coeffs, star_dict['ps_exposure'][k],
+                                star_dict['ps_weight'][k], star_dict['ps_mask'][k],
+                                star_dict['star_x'][k], star_dict['star_y'][k],
+                                star_dict['stellar_flux'][k], star_dict['sky_level'][k],
+                                ccd_shape, max_shift=5.)
+
+        print 'dx,dy = ({:.3f}, {:.3f})\n\n'.format(dx, dy)
 
     # Calculate corrections to fluxes, by normalizing PSFs
     psf_norm = np.empty(n_stars, dtype='f8')
@@ -483,6 +503,32 @@ def test_extract_psf():
                     dpi=120, bbox_inches='tight')
         plt.close(fig)
 
+    # Plot the central PSF shifted by different amounts
+    psf_img = eval_psf(psf_coeffs, 0.5, 0.5, (1.,1.))
+    psf_img /= np.max(psf_img)
+
+    for vmax in [1., 0.1, 0.01, 0.001]:
+        fig = plt.figure(figsize=(12,12), dpi=120)
+
+        for j,dx in enumerate(np.linspace(-5., 5., 3)):
+            for k,dy in enumerate(np.linspace(-5., 5., 3)):
+                tmp = sinc_shift_image(psf_img, dx, dy)#, roll_int=False)
+
+                ax = fig.add_subplot(3,3,3*k+j+1)
+
+                ax.imshow(tmp.T, origin='upper', aspect='equal',
+                          interpolation='nearest', cmap='bwr_r',
+                          vmin=-vmax, vmax=vmax)
+
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+        fig.subplots_adjust(wspace=0.01, hspace=0.01)
+
+        fig.savefig('psf_shifted_{:.3f}.png'.format(vmax),
+                    dpi=120, bbox_inches='tight')
+        plt.close(fig)
+
     # Plot postage stamps of the stars
     ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
     ps_y_cent = 0.5 * float(star_dict['ps_exposure'].shape[2]-1.)
@@ -509,6 +555,13 @@ def test_extract_psf():
         ax.imshow(tmp.T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
                   vmin=-ps_vmax[-1], vmax=ps_vmax[-1])
+
+        tmp = (star_dict['ps_chisq_mask'][k] == 0).astype('f8')
+        tmp[tmp < 0.01] = np.nan
+
+        ax.imshow(tmp.T, origin='upper', aspect='equal',
+                  interpolation='nearest', cmap='winter',
+                  vmin=0., vmax=1., alpha=0.25)
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -540,8 +593,6 @@ def test_extract_psf():
             #vmin, vmax = np.percentile(tmp[idx], [1., 99.8])
             vmin, vmax = np.min(tmp[idx]), np.max(tmp[idx])
 
-        print 'star {:2d}: ({:.5f}, {:.5f})'.format(k, vmin, vmax)
-
         ax = fig.add_subplot(n_x, n_y, k+1, axisbg='g')
 
         ax.imshow(tmp.T, origin='upper', aspect='equal',
@@ -567,6 +618,7 @@ def test_extract_psf():
     # Plot postage stamps of the residuals (after subtracting off model of psf)
     fig = plt.figure(figsize=(n_x,n_y), dpi=100)
     fig_stretch = plt.figure(figsize=(n_x,n_y), dpi=100)
+    fig_weighted = plt.figure(figsize=(n_x,n_y), dpi=100)
 
     tmp = star_dict['ps_exposure']
     tmp = tmp[(star_dict['ps_mask'] == 0) & np.isfinite(tmp)]
@@ -593,8 +645,11 @@ def test_extract_psf():
         tmp = star_dict['ps_exposure'][k] - psf_model
         tmp[star_dict['ps_mask'][k] != 0] = np.nan
 
+        chi = tmp * np.sqrt(star_dict['ps_weight'][k])
+
         ax = fig.add_subplot(n_x, n_y, k+1, axisbg='g')
         ax_stretch = fig_stretch.add_subplot(n_x, n_y, k+1, axisbg='g')
+        ax_weighted = fig_weighted.add_subplot(n_x, n_y, k+1, axisbg='g')
 
         ax.imshow(tmp.T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
@@ -602,6 +657,9 @@ def test_extract_psf():
         ax_stretch.imshow(tmp.T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
                   vmin=-vmax_stretch, vmax=vmax_stretch)
+        ax_weighted.imshow(chi.T, origin='upper', aspect='equal',
+                  interpolation='nearest', cmap='bwr_r',
+                  vmin=-3., vmax=3.)
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -615,24 +673,33 @@ def test_extract_psf():
                                              facecolor='cyan', alpha=0.5)
         ax_stretch.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
                                              facecolor='cyan', alpha=0.5)
+        ax_weighted.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
+                                             facecolor='cyan', alpha=0.5)
 
         ax.set_xticks([])
         ax.set_yticks([])
         ax_stretch.set_xticks([])
         ax_stretch.set_yticks([])
+        ax_weighted.set_xticks([])
+        ax_weighted.set_yticks([])
 
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         ax_stretch.set_xlim(xlim)
         ax_stretch.set_ylim(ylim)
+        ax_weighted.set_xlim(xlim)
+        ax_weighted.set_ylim(ylim)
 
     fig.subplots_adjust(wspace=0.01, hspace=0.01)
     fig_stretch.subplots_adjust(wspace=0.01, hspace=0.01)
+    fig_weighted.subplots_adjust(wspace=0.01, hspace=0.01)
 
     fig.savefig('postage_stamps_resid.png', dpi=300, bbox_inches='tight')
     fig_stretch.savefig('postage_stamps_resid_stretch.png', dpi=300, bbox_inches='tight')
+    fig_weighted.savefig('postage_stamps_resid_weighted.png', dpi=300, bbox_inches='tight')
     plt.close(fig)
     plt.close(fig_stretch)
+    plt.close(fig_weighted)
 
     # Plot the CCD image and weight, with stellar locations from PS1 overplotted
     vmin, vmax = np.percentile(img_data[(img_data > 1.) & (mask_data == 0)], [1.,99.])
