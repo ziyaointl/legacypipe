@@ -3,6 +3,8 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 
+import astropy.convolution
+
 from psf_extraction import *
 
 
@@ -24,6 +26,117 @@ def test_sinc_shift_image():
                            vmin=vmin, vmax=vmax)
 
     plt.show()
+
+
+def gen_test_data(psf_coeffs, sky_level=100., mag_20_flux=10000., band=3):
+    psf_shape = psf_coeffs.shape[1:]
+
+    # Load a test image
+    fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    img_data, weight_data, mask_data, wcs, exp_num = load_exposure(fname_pattern, 'S31')
+    ccd_shape = img_data.shape
+
+    # Load locations of PS1 stars
+    fname = 'psftest/ps1stars-c4d_150109_051822.fits'
+    ps1_table = astropy.io.fits.getdata(fname, 1)
+    star_x, star_y, ps1_mag = get_star_locations(ps1_table, wcs, img_data.shape, min_separation=1.)
+
+    # Clip to stars that fall on the CCD
+    #idx = ( (star_x > -psf_shape[0]) & (star_x < ccd_shape[0]+psf_shape[0])
+    #      & (star_y > -psf_shape[1]) & (star_y < ccd_shape[1]+psf_shape[1]) )
+
+    #idx = np.arange(10)
+    #star_x = star_x[idx]
+    #star_y = star_y[idx]
+    #ps1_table = ps1_table[idx]
+
+    # Transform stellar magnitudes to fluxes
+    star_flux = mag_20_flux * 10.**(-0.4 * (ps1_mag[:,band]-20.))
+
+    # Work on a larger canvas, so that edge effects can be ignored
+    img_shape = [ccd_shape[0]+2*psf_shape[0], ccd_shape[1]+2*psf_shape[1]]
+    dx = 0.5 * (psf_shape[0] - 1)
+    dy = 0.5 * (psf_shape[1] - 1)
+
+    # Fill the image with Gaussian background noise
+    img_mean = sky_level * np.ones(shape=img_shape, dtype='f8')
+    #img_mock = np.random.normal(loc=sky_level, scale=np.sqrt(sky_level), size=img_data.shape)
+
+    psf_workspace = np.empty(shape=img_shape, dtype='f8')
+
+    # Add in each star
+    for k in range(len(star_x)):
+        print k, star_flux[k], ps1_mag[k,band]
+
+        # Evaluate the PSF at the position of the star
+        #psf_img = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
+        psf_workspace[:] = 0.
+        psf_workspace[:psf_shape[0],:psf_shape[1]] = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
+        psf_workspace *= star_flux[k] / np.sum(psf_workspace)
+
+        # Shift the PSF to be centered on the star
+        x_shift = int(np.around(star_x[k]+dx))
+        y_shift = int(np.around(star_y[k]+dy))
+        psf_workspace = np.roll(psf_workspace, x_shift, axis=0)
+        psf_workspace = np.roll(psf_workspace, y_shift, axis=1)
+
+        img_mean += psf_workspace
+        #img_mean += sinc_shift_image(psf_workspace, star_x[k]+dx, star_y[k]+dy)
+
+    # Clip the image
+    img_mean = img_mean[psf_shape[0]:-psf_shape[0], psf_shape[1]:-psf_shape[1]]
+
+    # Add noise into the image
+    img_model = img_mean + np.sqrt(img_mean) * np.random.normal(loc=0., scale=1., size=ccd_shape)
+
+    # Calculate the weights (assume Poisson statistics)
+    weight_model = 1. / img_mean
+
+    # Copy the mask
+    mask_model = np.empty(ccd_shape, dtype='f8')
+    mask_model[:] = mask_data[:]
+
+    return img_model, weight_model, mask_model, star_x, star_y
+
+
+def test_gen_data():
+    psf_sigma = 3.
+    psf_coeffs = np.zeros((6,63,63), dtype='f8')
+    psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+        psf_sigma, x_size=psf_coeffs.shape[1], y_size=psf_coeffs.shape[2],
+        mode='oversample', factor=5
+    ))
+
+    img_model, weight_model, mask_model, star_x, star_y  = gen_test_data(psf_coeffs)
+
+    # Plot the CCD image and weight, with stellar locations from PS1 overplotted
+    vmin, vmax = np.percentile(img_model[(img_model > 1.) & (mask_model == 0)], [1.,99.])
+
+    fig = plt.figure(dpi=300)
+
+    ax = fig.add_subplot(2,1,1, axisbg='g')
+    img_model[(mask_model != 0)] = np.nan
+    ax.imshow(img_model.T, origin='upper', aspect='equal', interpolation='nearest',
+                           cmap='binary_r', vmin=vmin, vmax=vmax)
+
+    ax.scatter(star_x, star_y,
+               s=12, edgecolor='b', facecolor='none',
+               lw=0.75, alpha=0.75)
+
+    ax.set_xlim(0, img_model.shape[0])
+    ax.set_ylim(0, img_model.shape[1])
+
+    ax = fig.add_subplot(2,1,2, axisbg='g')
+    sigma = 1. / np.sqrt(weight_model)
+    vmin_s, vmax_s = np.percentile(sigma[np.isfinite(sigma) & (mask_model == 0)], [0.1, 99.5])
+    sigma[(mask_model != 0)] = np.nan
+    ax.imshow(sigma.T, origin='upper', aspect='equal', interpolation='nearest',
+                       cmap='binary_r', vmin=vmin_s, vmax=vmax_s)
+
+    fig.savefig('mock_data/ccd_model.png', dpi=300, bbox_inches='tight')
+
+    return
+
 
 
 def test_load_exposure():
@@ -204,19 +317,36 @@ def test_filter_neighbors():
     plt.show()
 
 
-def test_extract_psf():
+def test_extract_psf(replace_with_mock=False):
     # Load a test image
-    #fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
-    fname_pattern = 'psfunit/detest-00396086-S31-oo{}.fits.fz'
+    fname_pattern = 'psftest/c4d_150109_051822_oo{}_z_v1.fits.fz'
+    #fname_pattern = 'psfunit/detest-00396086-S31-oo{}.fits.fz'
     ccd_id = 'S31'
     img_data, weight_data, mask_data, wcs, exp_num = load_exposure(fname_pattern, ccd_id)
     ccd_shape = img_data.shape
+
+    if replace_with_mock:
+        psf_sigma = 3.
+        psf_coeffs = np.zeros((6,63,63), dtype='f8')
+        psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+            psf_sigma, x_size=psf_coeffs.shape[1], y_size=psf_coeffs.shape[2],
+            mode='oversample', factor=5
+        ))
+        #psf_coeffs[1] = 0.5 * np.array(astropy.convolution.Gaussian2DKernel(
+        #    2.*psf_sigma, x_size=psf_coeffs.shape[1], y_size=psf_coeffs.shape[2],
+        #    mode='oversample', factor=5
+        #))
+
+        img_data, weight_data, mask_data, star_x, star_y  = gen_test_data(psf_coeffs)
+        mask_data[:] = 0
+
+    print '# of masked pixels:', np.sum(mask_data != 0)
 
     # Extract the PSF
     psf_coeffs, star_dict = extract_psf(img_data, weight_data, mask_data, wcs,
                                         return_postage_stamps=True, n_iter=5,
                                         min_pixel_fraction=0.75,
-                                        star_chisq_threshold=2.)
+                                        star_chisq_threshold=10., sky_sigma=0.05)
 
     n_stars = star_dict['ps_exposure'].shape[0]
     ccd_shape = img_data.shape
@@ -241,6 +371,7 @@ def test_extract_psf():
                                 ccd_shape)
 
     # Calculate the shift for each star
+    '''
     print 'Fitting star offsets:'
     for k in range(len(star_dict['ps_exposure'])):
         print 'Star {: 3d}'.format(k)
@@ -253,6 +384,7 @@ def test_extract_psf():
                                 ccd_shape, max_shift=5.)
 
         print 'dx,dy = ({:.3f}, {:.3f})\n\n'.format(dx, dy)
+    '''
 
     # Calculate corrections to fluxes, by normalizing PSFs
     psf_norm = np.empty(n_stars, dtype='f8')
@@ -334,7 +466,7 @@ def test_extract_psf():
     fig.savefig('star_fit_vs_ps1.svg', bbox_inches='tight')
     plt.close(fig)
 
-    # Scatterplot of fit flux vs. sky level
+    # Scatterplot of fit magnitude vs. sky level
     fig = plt.figure(figsize=(8,8), dpi=100)
     ax = fig.add_subplot(1,1,1)
     ax.scatter(fit_mag, star_dict['sky_level'],
@@ -342,8 +474,22 @@ def test_extract_psf():
     ax.set_xlabel(r'$\mathrm{fit \ magnitude}$', fontsize=18)
     ax.set_ylabel(r'$\mathrm{sky \ level}$', fontsize=18)
     ax.set_title(r'$\mathrm{Fit \ Parameters}$', fontsize=20)
+    ax.set_xlim(ax.get_xlim()[::-1])
 
     fig.savefig('star_fit_params.svg', bbox_inches='tight')
+    plt.close(fig)
+
+    # Scatterplot of PS1 magnitude vs. fit sky level
+    fig = plt.figure(figsize=(8,8), dpi=100)
+    ax = fig.add_subplot(1,1,1)
+    ax.scatter(star_dict['star_ps1_mag'][:,3], star_dict['sky_level'],
+               edgecolor='none', facecolor='b', s=10)
+    ax.set_xlabel(r'$z_{\mathrm{PS1}}$', fontsize=18)
+    ax.set_ylabel(r'$\mathrm{sky \ level}$', fontsize=18)
+    ax.set_title(r'$\mathrm{Sky \ Level \ Trend}$', fontsize=20)
+    ax.set_xlim([21., 11.])
+
+    fig.savefig('star_fit_sky_level.svg', bbox_inches='tight')
     plt.close(fig)
 
     # Plot the PSF coefficients
@@ -390,6 +536,7 @@ def test_extract_psf():
                     dpi=120, bbox_inches='tight')
         plt.close(fig)
 
+    '''
     # Plot the central PSF shifted by different amounts
     psf_img = eval_psf(psf_coeffs, 0.5, 0.5, (1.,1.))
     psf_img /= np.max(psf_img)
@@ -415,6 +562,7 @@ def test_extract_psf():
         fig.savefig('psf_shifted_{:.3f}.png'.format(vmax),
                     dpi=120, bbox_inches='tight')
         plt.close(fig)
+    '''
 
     # Plot postage stamps of the stars
     ps_x_cent = 0.5 * float(star_dict['ps_exposure'].shape[1]-1.)
@@ -470,7 +618,7 @@ def test_extract_psf():
     fig = plt.figure(figsize=(n_x,n_y), dpi=100)
 
     for k in range(n_stars):
-        tmp = star_dict['ps_weight'][k] * star_dict['ps_exposure'][k]
+        tmp = 1. / np.sqrt(star_dict['ps_weight'][k])
         tmp[star_dict['ps_mask'][k] != 0] = np.nan
 
         vmin, vmax = 0., 1.
@@ -484,7 +632,7 @@ def test_extract_psf():
 
         ax.imshow(tmp.T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
-                  vmin=vmin, vmax=vmax)
+                  vmin=-vmax, vmax=vmax)
 
         xlim = ax.get_xlim()
         ylim = ax.get_ylim()
@@ -553,8 +701,20 @@ def test_extract_psf():
         x_txt = xlim[0] + 0.05 * (xlim[1] - xlim[0])
         y_txt = ylim[0] + 0.05 * (ylim[1] - ylim[0])
 
-        ax.text(x_txt, y_txt, r'${:.1f}$'.format(psf_resid[k]))
-        ax_stretch.text(x_txt, y_txt, r'${:.1f}$'.format(psf_resid[k]))
+        txt = r'${:.1f}$'.format(psf_resid[k])
+        ax.text(x_txt, y_txt, txt)
+        ax_stretch.text(x_txt, y_txt, txt)
+        ax_weighted.text(x_txt, y_txt, txt)
+
+        xlim = ax.get_xlim()
+        ylim = ax.get_ylim()
+        x_txt = xlim[0] + 0.95 * (xlim[1] - xlim[0])
+        y_txt = ylim[0] + 0.95 * (ylim[1] - ylim[0])
+
+        txt = r'${:.1f}$'.format(star_dict['star_ps1_mag'][k,3])
+        ax.text(x_txt, y_txt, txt, ha='right', va='top')
+        ax_stretch.text(x_txt, y_txt, txt, ha='right', va='top')
+        ax_weighted.text(x_txt, y_txt, txt, ha='right', va='top')
 
         ax.scatter([ps_x_cent], [ps_y_cent], s=3., edgecolor='none',
                                              facecolor='cyan', alpha=0.5)
@@ -625,7 +785,8 @@ def test_extract_psf():
 
 
 def main():
-    test_extract_psf()
+    test_extract_psf(replace_with_mock=True)
+    #test_gen_data()
 
     return 0
 
