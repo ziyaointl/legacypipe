@@ -3,6 +3,8 @@
 import numpy as np
 import scipy.ndimage
 
+from scipy.special import eval_chebyt
+
 import astropy.wcs
 import astropy.io
 import astropy.convolution
@@ -352,18 +354,36 @@ def filter_close_points(x, y, r):
 
 
 def eval_psf(psf_coeffs, star_x, star_y, ccd_shape):
-    x = star_x / float(ccd_shape[0])
-    y = star_y / float(ccd_shape[1])
+    '''
+    Evaluate the PSF at one location on the CCD.
+
+    Inputs:
+      psf_coeffs  Images of the PSF at different orders. The shape is
+                  (order, x, y). The zeroeth-order term is the term that is
+                  constant over the CCD. Entries 1 and 2 describe the x- and
+                  y-dependent terms, respectively. Entries 3 and 4 describe the
+                  x^2- and y^2-dependent terms, respectively, while entry 5
+                  describes the strength of the xy-dependent term.
+      star_x      The x-coordinate (in pixels) at which to evaluate the PSF.
+      star_y      The y-coordinate (in pixels) at which to evaluate the PSF.
+      ccd_shape   The shape of the PSF, (n_x, n_y), in pixels.
+
+    Output:
+      psf_img  An image of the PSF evaluated at (star_x, star_y).
+    '''
+
+    x = 2. * star_x / float(ccd_shape[0]) - 1.
+    y = 2. * star_y / float(ccd_shape[1]) - 1.
 
     psf_img = np.empty((psf_coeffs.shape[1], psf_coeffs.shape[2]), dtype='f8')
 
     # TODO: Generalize this to arbitrary orders of x,y
     psf_img[:,:] = psf_coeffs[0,:,:]
-    psf_img[:,:] += psf_coeffs[1,:,:] * x
-    psf_img[:,:] += psf_coeffs[2,:,:] * y
-    psf_img[:,:] += psf_coeffs[3,:,:] * x*x
-    psf_img[:,:] += psf_coeffs[4,:,:] * y*y
-    psf_img[:,:] += psf_coeffs[5,:,:] * x*y
+    psf_img[:,:] += psf_coeffs[1,:,:] * eval_chebyt(1, x)
+    psf_img[:,:] += psf_coeffs[2,:,:] * eval_chebyt(1, y)
+    psf_img[:,:] += psf_coeffs[3,:,:] * eval_chebyt(2, x)
+    psf_img[:,:] += psf_coeffs[4,:,:] * eval_chebyt(2, y)
+    psf_img[:,:] += psf_coeffs[5,:,:] * eval_chebyt(1, x) * eval_chebyt(1, y)
 
     return psf_img
 
@@ -437,9 +457,9 @@ def fit_psf_coeffs(star_flux, star_sky,
     if not isinstance(sigma_nonzero_order, np.ndarray):
         sigma_nonzero_order = sigma_nonzero_order * np.ones((n_x, n_y), dtype='f8')
 
-    # Scale coordinates so that x,y are each in range [0,1]
-    x = star_x / float(ccd_shape[0])
-    y = star_y / float(ccd_shape[1])
+    # Scale coordinates so that x,y are each in range [-1,1]
+    x = 2. * star_x / float(ccd_shape[0]) - 1.
+    y = 2. * star_y / float(ccd_shape[1]) - 1.
 
     # Subtract each star's sky level from its postage stamp
     img_zeroed = ps_exposure - star_sky[:,None,None]
@@ -455,11 +475,11 @@ def fit_psf_coeffs(star_flux, star_sky,
 
     # TODO: Generalize this to arbitrary orders of x,y
     A_base[:n_stars,0] = 1.
-    A_base[:n_stars,1] = x
-    A_base[:n_stars,2] = y
-    A_base[:n_stars,3] = x**2.
-    A_base[:n_stars,4] = y**2.
-    A_base[:n_stars,5] = x*y
+    A_base[:n_stars,1] = eval_chebyt(1, x)
+    A_base[:n_stars,2] = eval_chebyt(1, y)
+    A_base[:n_stars,3] = eval_chebyt(2, x)
+    A_base[:n_stars,4] = eval_chebyt(2, y)
+    A_base[:n_stars,5] = eval_chebyt(1, x) * eval_chebyt(1, y)
 
     # Data matrix
     b = np.zeros(n_stars+6, dtype='f8')
@@ -483,6 +503,7 @@ def fit_psf_coeffs(star_flux, star_sky,
             #A[:n_stars,:] *= sqrt_w[:,None,j,k]
             A[-6] *= 0. # Prior on the zeroeth-order term
             A[-5:] *= 1 / sigma_nonzero_order[j,k] # Prior on higher-order terms
+            #A[-4:] *= 9.e20 # TODO: Remove this hack
 
             # Data matrix
             b[:n_stars] = img_zeroed[:,j,k] * star_flux[:] #* sqrt_w[:n_stars,j,k]
@@ -1010,8 +1031,17 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
             star_x[idx], star_y[idx],
             ccd_shape, psf_coeffs
         )
+        # TODO: Make flux predictor robust against missing PS1 bands and uncomment following lines
         #stellar_flux_mean[:] = flux_predictor(star_ps1_mag)
         #stellar_flux_sigma[:] = np.sqrt(stellar_flux_mean)
+
+        # Prior on nonzero-order PSF coefficients
+        sigma_tmp = 0.01 * psf_coeffs[0]
+        if j > 5:
+            sigma_tmp = sigma_nonzero_order * psf_coeffs[0]
+
+        sigma_tmp[sigma_tmp < 0.] = 0.
+        sigma_tmp = np.sqrt(sigma_tmp**2. + 0.01**2.)
 
         # Fit the PSF coefficients in each pixel
         if j == 0:
@@ -1023,10 +1053,6 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
             ps_mask_effective = ((ps_mask[idx] != 0) | (ps_chisq_mask[idx] > 0.1)).astype('f8')
         else:
             ps_mask_effective = ps_mask[idx]
-
-        sigma_tmp = sigma_nonzero_order * psf_coeffs[0]
-        sigma_tmp[sigma_tmp < 0.] = 0.
-        sigma_tmp = np.sqrt(sigma_tmp**2. + 0.01**2.)
 
         psf_coeffs = fit_psf_coeffs(stellar_flux[idx], sky_level[idx],
                                     star_x[idx], star_y[idx],
