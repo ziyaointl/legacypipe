@@ -481,6 +481,8 @@ def fit_psf_coeffs(star_flux, star_sky,
     A_base[:n_stars,4] = eval_chebyt(2, y)
     A_base[:n_stars,5] = eval_chebyt(1, x) * eval_chebyt(1, y)
 
+    A_base[:n_stars,:] *= star_flux[:,None]
+
     # Data matrix
     b = np.zeros(n_stars+6, dtype='f8')
 
@@ -496,17 +498,18 @@ def fit_psf_coeffs(star_flux, star_sky,
     psf_coeffs = np.empty((6, n_x, n_y), dtype='f8')
 
     # Loop over pixels in PSF, fitting coefficients for each pixel separately
+    resid_tmp = np.empty((n_x, n_y), dtype='f8')
+
     for j in range(n_x):
         for k in range(n_y):
             # Design matrix
             A[:] = A_base[:]
-            #A[:n_stars,:] *= sqrt_w[:,None,j,k]
+            A[:n_stars,:] *= sqrt_w[:,None,j,k]
             A[-6] *= 0. # Prior on the zeroeth-order term
             A[-5:] *= 1 / sigma_nonzero_order[j,k] # Prior on higher-order terms
-            #A[-4:] *= 9.e20 # TODO: Remove this hack
 
             # Data matrix
-            b[:n_stars] = img_zeroed[:,j,k] * star_flux[:] #* sqrt_w[:n_stars,j,k]
+            b[:n_stars] = img_zeroed[:,j,k] * sqrt_w[:n_stars,j,k]
             b[mask_pix] = 0.
 
             # Remove NaN and Inf values
@@ -514,7 +517,35 @@ def fit_psf_coeffs(star_flux, star_sky,
             b[~np.isfinite(b)] = 0.
 
             # Execute least squares
-            psf_coeffs[:,j,k] = np.linalg.lstsq(A, b)[0]
+            psf_coeffs[:,j,k], resid_tmp[j,k], _, _ = np.linalg.lstsq(A[:n_stars], b[:n_stars])#[0]
+            #psf_coeffs[:,j,k], resid_tmp[j,k], _, _ = scipy.linalg.lstsq(A[:n_stars], b[:n_stars])#[0]
+
+            '''
+            if (j == 31) and (k == 31):
+                bp = np.dot(A, psf_coeffs[:,j,k])
+                resid = (b[:n_stars] - bp[:n_stars]) * sqrt_w[:,j,k]
+
+                print ''
+                print 'Ax - b:'
+                print resid
+                print ''
+
+                pctiles = np.percentile(resid, [1., 50., 99.])
+                width = 0.5 * (pctiles[-1] - pctiles[0])
+                x0, x1 = pctiles[1] - width, pctiles[1] + width
+                bins = np.linspace(x0, x1, 50)
+
+                import matplotlib.pyplot as plt
+                fig = plt.figure(figsize=(8,4), dpi=120)
+                ax = fig.add_subplot(1,1,1)
+                ax.hist(resid, bins, normed=1, histtype='stepfilled')
+                plt.show()
+            '''
+
+
+    #np.set_printoptions(precision=3, linewidth=200)
+    #print resid_tmp[29:35, 29:35] / 1000.
+    #print resid_tmp[:5, :5] / 1000.
 
     return psf_coeffs
 
@@ -984,6 +1015,8 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     ps_mask_effective = None
     ps_chisq_mask = None
 
+    #star_chisq_threshold_iter = np.linspace(10. * star_chisq_threshold, star_chisq_threshold, n_iter)
+
     # Iterate linear fits to reach the solution
     for j in range(n_iter):
         # Fit the flux and local sky level for each star
@@ -1009,9 +1042,14 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
         )
         idx_chisq = (star_chisq < star_chisq_threshold)
 
+        print ''
+        print 'star chi^2:'
+        print star_chisq
+        print ''
+
         # Flag pixels with bad chi^2/dof
         ps_chisq_mask = (np.abs(star_chisq_img) > star_chisq_threshold).astype('f8')
-        print '{:.2f} % of pixels masked'.format(np.sum(ps_chisq_mask) / float(ps_chisq_mask.size))
+        #print '{:.2f} % of pixels masked'.format(np.sum(ps_chisq_mask) / float(ps_chisq_mask.size))
         kern = astropy.convolution.Box2DKernel(3)
         #for k in range(n_stars):
         #    ps_chisq_mask[k] = astropy.convolution.convolve(ps_chisq_mask[k], kern,
@@ -1155,7 +1193,7 @@ def load_exposure(fname_pattern, ccd_id):
 
     weight_data = pyfits.getdata(fname_pattern.format('w'), ccd_id)
     mask_data = pyfits.getdata(fname_pattern.format('d'), ccd_id)
-    mask_data[:] = 0.
+    #mask_data[:] = 0.
 
     # Fix the weights
     weight_data[weight_data < 0.] = 0.
