@@ -8,6 +8,77 @@ import astropy.convolution
 from psf_extraction import *
 
 
+def test_psf_coeff_fit():
+    # Set up the PSF
+    psf_size = 63
+    psf_sigma = 3.
+    psf_coeffs = np.zeros((6,psf_size,psf_size), dtype='f8')
+    psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+        psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    psf_coeffs[1] = 0.5 * np.array(astropy.convolution.Gaussian2DKernel(
+        0.75*psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    psf_coeffs = normalize_psf_coeffs(psf_coeffs)
+
+    # Generate the stellar postage stamps
+    n_stars = 10000
+    ccd_shape = (4000,2000)
+    x_star = ccd_shape[0] * np.random.random(n_stars)
+    y_star = ccd_shape[1] * np.random.random(n_stars)
+    flux_model = 100. * np.random.random(n_stars)
+    sky_model = 0. * np.random.normal(loc=10., scale=1., size=n_stars)
+
+    ps_img = np.empty((n_stars,psf_size,psf_size), dtype='f8')
+
+    for k,(x,y) in enumerate(zip(x_star, y_star)):
+        ps_img[k] = sky_model[k] + flux_model[k] * eval_psf(psf_coeffs, x, y, ccd_shape)
+
+    ps_weight = 1. / ps_img                         # Assuming Poisson statistics
+    ps_mask = np.zeros(ps_img.shape, dtype='f8')    # No masked pixels
+
+    # Add in poisson noise to the image
+    ps_img += np.sqrt(ps_img) * np.random.normal(loc=0., scale=1., size=ps_img.shape)
+
+    # Plot the residuals with the true PSF
+
+    # Fit the PSF coefficients, putting in the correct flux and sky levels
+    psf_coeffs_fit = fit_psf_coeffs(
+        flux_model,
+        sky_model,
+        x_star,
+        y_star,
+        ccd_shape,
+        ps_img,
+        ps_weight,
+        ps_mask,
+        sigma_nonzero_order=1.
+    )
+
+    psf_coeffs_fit = normalize_psf_coeffs(psf_coeffs_fit)
+
+    # Plot the model and fitted PSF coefficients
+    vmax = np.max([np.max(np.abs(psf_coeffs)), np.max(np.abs(psf_coeffs_fit))])
+
+    fig = plt.figure(figsize=(12,6), dpi=120)
+    l = 0
+    for j,coeffs in enumerate([psf_coeffs, psf_coeffs_fit, psf_coeffs_fit-psf_coeffs]):
+        for k,img in enumerate(coeffs):
+            l += 1
+            ax = fig.add_subplot(3, 6, l)
+            ax.imshow(img.T, origin='upper', aspect='equal', interpolation='nearest',
+                             cmap='bwr_r', vmin=-vmax, vmax=vmax)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    fig.subplots_adjust(hspace=0.01, wspace=0.01)
+    fig.savefig('psf_coeff_fit_test.svg', bbox_inches='tight')
+
+    return
+
+
 def test_sinc_shift_image():
     from PIL import Image
     im = Image.open('psftest/shift.png')
@@ -28,7 +99,7 @@ def test_sinc_shift_image():
     plt.show()
 
 
-def gen_test_data(psf_coeffs, sky_level=100., mag_20_flux=10000., band=3):
+def gen_test_data(psf_coeffs, sky_level=100., limiting_mag=24., band=3):
     psf_shape = psf_coeffs.shape[1:]
 
     # Load a test image
@@ -51,7 +122,8 @@ def gen_test_data(psf_coeffs, sky_level=100., mag_20_flux=10000., band=3):
     #ps1_table = ps1_table[idx]
 
     # Transform stellar magnitudes to fluxes
-    star_flux = mag_20_flux * 10.**(-0.4 * (ps1_mag[:,band]-20.))
+    limiting_mag_flux = 5. * np.sqrt(sky_level)
+    star_flux = limiting_mag_flux * 10.**(-0.4 * (ps1_mag[:,band]-limiting_mag))
 
     # Work on a larger canvas, so that edge effects can be ignored
     img_shape = [ccd_shape[0]+2*psf_shape[0], ccd_shape[1]+2*psf_shape[1]]
@@ -171,14 +243,14 @@ def test_extract_psf(replace_with_mock=False):
             psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
             mode='oversample', factor=5
         ))
-        #psf_coeffs_model[0] += 0.5 * np.array(astropy.convolution.Gaussian2DKernel(
-        #    2.*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
-        #    mode='oversample', factor=5
-        #))
-        #psf_coeffs_model[1] = 0.5 * np.array(astropy.convolution.Gaussian2DKernel(
-        #    2.*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
-        #    mode='oversample', factor=5
-        #))
+        psf_coeffs_model[0] += 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
+            1.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+            mode='oversample', factor=5
+        ))
+        psf_coeffs_model[1] = 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
+            1.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+            mode='oversample', factor=5
+        ))
 
         img_data, weight_data, mask_data, star_x, star_y  = gen_test_data(psf_coeffs_model)
         mask_data[:] = 0
@@ -187,9 +259,9 @@ def test_extract_psf(replace_with_mock=False):
 
     # Extract the PSF
     psf_coeffs, star_dict = extract_psf(img_data, weight_data, mask_data, wcs,
-                                        return_postage_stamps=True, n_iter=10,
+                                        return_postage_stamps=True, n_iter=8,
                                         min_pixel_fraction=0.75,
-                                        star_chisq_threshold=1.e10,
+                                        star_chisq_threshold=10.,
                                         sky_sigma=0.05,
                                         sigma_nonzero_order=1.)
 
@@ -366,8 +438,6 @@ def test_extract_psf(replace_with_mock=False):
 
             for j,x in enumerate(np.linspace(0, ccd_shape[0], 3)):
                 for k,y in enumerate(np.linspace(0, ccd_shape[1], 3)):
-                    print plt_fname
-                    print pc.shape
                     tmp = eval_psf(pc, x, y, ccd_shape)
                     tmp /= np.max(np.abs(tmp))
 
@@ -637,6 +707,7 @@ def test_extract_psf(replace_with_mock=False):
 
 
 def main():
+    #test_psf_coeff_fit()
     test_extract_psf(replace_with_mock=True)
     #test_gen_data()
 
