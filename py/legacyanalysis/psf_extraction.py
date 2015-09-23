@@ -165,7 +165,7 @@ def sinc_shift_image(img, dx, dy, roll_int=True):
 
 def fit_star_offset(psf_coeffs, ps_exposure, ps_weight, ps_mask,
                     star_x, star_y, star_flux, sky_level, ccd_shape,
-                    max_shift=5.):
+                    max_shift=5., verbose=False):
     #print psf_coeffs.shape
     #print star_x.shape
 
@@ -219,8 +219,8 @@ def fit_star_offset(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     # Minimize chi^2/dof by shifting the model image of the star
     # TODO: Test other algorithms, like 'BFGS', and see why some stars only use one iteration.
     x0 = np.array([0.,0.])
-    res = scipy.optimize.minimize(f_obj, x0, method='nelder-mead',
-                                  options={'xtol': 1.e-3, 'disp': False, 'maxiter': 250})
+    res = scipy.optimize.minimize(f_obj, x0, method='BFGS',#'nelder-mead',
+                                  options={'xtol': 1.e-8, 'disp': verbose, 'maxiter': 250})
 
     # Transform the result from primed to unprimed coordinates
     dx_opt, dy_opt = xp2x(res.x)
