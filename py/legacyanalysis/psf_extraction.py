@@ -388,6 +388,27 @@ def eval_psf(psf_coeffs, star_x, star_y, ccd_shape):
     return psf_img
 
 
+def calc_psf_fluxes(psf_coeffs, star_x, star_y, ccd_shape):
+    '''
+    Calculate the total flux in the PSF (i.e., the sum over the PSF) at each of
+    the specified locations on the CCD.
+
+    Inputs:
+      psf_coeffs  Images of the PSF at different orders. The shape is
+                  (order, x, y). The zeroeth-order term is the term that is
+                  constant over the CCD. Entries 1 and 2 describe the x- and
+                  y-dependent terms, respectively. Entries 3 and 4 describe the
+                  x^2- and y^2-dependent terms, respectively, while entry 5
+                  describes the strength of the xy-dependent term.
+      star_x      The x-coordinates (in pixels) at which to evaluate the PSF.
+      star_y      The y-coordinates (in pixels) at which to evaluate the PSF.
+      ccd_shape   The shape of the PSF, (n_x, n_y), in pixels.
+
+    Output:
+      psf_flux  The flux in the PSF at each location (same shape as `star_x`
+                and `star_y`).
+    '''
+    return np.array([np.sum(eval_psf(psf_coeffs,x,y,ccd_shape)) for x,y in zip(star_x,star_y)])
 
 
 def fit_star_params(psf_coeffs, star_x, star_y,
@@ -400,14 +421,14 @@ def fit_star_params(psf_coeffs, star_x, star_y,
 
     # Evaluate the PSF at the location of the star
     psf_val = eval_psf(psf_coeffs, star_x, star_y, ccd_shape)
-    #psf_val /= np.sum(psf_val)
+    psf_norm = np.sum(psf_val)
+    psf_val /= psf_norm
     psf_val.shape = (psf_val.size,)
 
     # Normalize the stellar flux priors
-    psf_norm = np.sum(psf_val)
-    stellar_flux_mean = stellar_flux_mean / psf_norm
-    stellar_flux_sigma = stellar_flux_sigma / psf_norm
-    #print 'stellar flux prior: {:.5f} +- {:.5f}'.format(stellar_flux_mean, stellar_flux_sigma)
+    #psf_norm = np.sum(psf_val)
+    #stellar_flux_mean = stellar_flux_mean / psf_norm
+    #stellar_flux_sigma = stellar_flux_sigma / psf_norm
 
     # Calculate the square root of the weight
     sqrt_w = np.sqrt(ps_weight.flat)
@@ -430,22 +451,14 @@ def fit_star_params(psf_coeffs, star_x, star_y,
     A = np.vstack([A, A_priors])
     b = np.hstack([b, b_priors])
 
-    #print ''
-    #print 'A:'
-    #print A
-    #print ''
-    #print 'b:'
-    #print b
-    #print ''
-
     # Remove NaN and Inf values
     A[~np.isfinite(A)] = 0.
     b[~np.isfinite(b)] = 0.
 
     # Execute least squares
-    a0, a1 = np.linalg.lstsq(A, b)[0]
+    star_flux, sky_level = np.linalg.lstsq(A, b)[0]
 
-    return a0, a1
+    return star_flux, sky_level
 
 
 def fit_psf_coeffs(star_flux, star_sky,

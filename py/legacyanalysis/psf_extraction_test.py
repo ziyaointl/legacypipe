@@ -8,7 +8,8 @@ import astropy.convolution
 from psf_extraction import *
 
 
-def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.):
+def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
+                            mask_prob=0.25, max_mask_size=0.25):
         # Set up the PSF
         assert (psf_coeffs.shape[1] == psf_coeffs.shape[2])
         psf_size = psf_coeffs.shape[1]
@@ -27,10 +28,19 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.):
         ps_img = np.empty((n_stars,psf_size,psf_size), dtype='f8')
 
         for k,(x,y) in enumerate(zip(x_star, y_star)):
-            ps_img[k] = sky_model[k] + flux_model[k] * eval_psf(psf_coeffs, x, y, ccd_shape)
+            psf_local = eval_psf(psf_coeffs, x, y, ccd_shape)
+            psf_local /= np.sum(psf_local)
+            ps_img[k] = sky_model[k] + flux_model[k] * psf_local
 
         ps_weight = 1. / ps_img                         # Poisson statistics
         ps_mask = np.zeros(ps_img.shape, dtype='f8')    # No masked pixels
+
+        idx_star_mask = np.where(np.random.random(n_stars) < mask_prob)[0]
+        for k in idx_star_mask:
+            w = psf_size * max_mask_size * np.random.random()
+            i0 = int(np.floor(0.5 * (psf_size - w)))
+            i1 = int(np.ceil(0.5 * (psf_size + w))) + 1
+            ps_mask[k,i0:i1,i0:i1] = 1.
 
         # Add in poisson noise to the image
         ps_img += np.sqrt(ps_img) * np.random.normal(loc=0., scale=1., size=ps_img.shape)
@@ -38,7 +48,7 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.):
         return ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape
 
 
-def test_psf_coeff_fit():
+def test_star_fit():
     # Set up the PSF
     psf_size = 63
     psf_sigma = 3.
@@ -55,11 +65,121 @@ def test_psf_coeff_fit():
 
     # Generate the stellar postage stamps
     n_stars = 1000
-    ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape = gen_mock_postage_stamps(psf_coeffs, n_stars)
+    (ps_img, ps_weight, ps_mask,
+     x_star, y_star,
+     flux_model, sky_model,
+     ccd_shape) = gen_mock_postage_stamps(psf_coeffs, n_stars,
+                                          flux_max=1.e4,
+                                          mask_prob=0.25,
+                                          max_mask_size=0.25)
+
+    # Priors
+    sky_fit_sigma = 1.e99
+    flux_fit_mean = flux_model
+    flux_fit_sigma = 1.e99 * np.sqrt(flux_model)
+
+    # Fit the flux and sky level for each star
+    flux_fit = np.empty(n_stars, dtype='f8')
+    sky_fit = np.empty(n_stars, dtype='f8')
+
+    for k in range(n_stars):
+        flux_fit[k], sky_fit[k] = fit_star_params(
+            psf_coeffs,
+            x_star[k], y_star[k],
+            ps_img[k], ps_weight[k],
+            ps_mask[k], ccd_shape,
+            sky_sigma=sky_fit_sigma,
+            stellar_flux_mean=flux_fit_mean[k],
+            stellar_flux_sigma=flux_fit_sigma[k]
+        )
+
+    # Plot results
+    fig = plt.figure(figsize=(16,7), dpi=120)
+
+    mask_frac = np.sum(np.sum(ps_mask > 1.e-5, axis=1), axis=1) / psf_size**2.
+
+    # True vs. fitted flux
+    ax = fig.add_subplot(1,2,1)
+    ax.scatter(flux_model, flux_fit, s=5,
+               c=mask_frac, vmin=0., vmax=0.1, cmap='RdYlGn_r',
+               edgecolor='none', alpha=0.5)
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    x0 = min([xlim[0], ylim[0]])
+    x1 = min([xlim[1], ylim[1]])
+    ax.plot([x0,x1], [x0,x1], 'g-', alpha=0.2, lw=1.5)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+    ax.set_xlabel(r'$\mathrm{True \ Flux}$', fontsize=16)
+    ax.set_ylabel(r'$\mathrm{Fitted \ Flux}$', fontsize=16)
+
+    # True flux vs. fitted sky level
+    ax = fig.add_subplot(1,2,2)
+    ax.scatter(flux_model, sky_fit-sky_model,
+               c=mask_frac, vmin=0., vmax=0.1, cmap='RdYlGn_r',
+               edgecolor='none', alpha=0.5)
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    ax.plot(xlim, [0.,0.], 'g-', alpha=0.2, lw=1.5)
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+    ax.set_xlabel(r'$\mathrm{True \ Flux}$', fontsize=16)
+    ax.set_ylabel(r'$\mathrm{Sky \ Residual}$', fontsize=16)
+
+    fig.suptitle(r'$\mathrm{Stellar \ Parameter \ Fitting \ Test}$', fontsize=18)
+
+    fig.savefig('mock_data/plots/star_fit.svg', dpi=120, bbox_inches='tight')
+
+
+
+def test_psf_coeff_fit():
+    # Set up the PSF
+    psf_size = 63
+    psf_sigma = 3.
+    psf_coeffs = np.zeros((6,psf_size,psf_size), dtype='f8')
+    psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+        psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    psf_coeffs[1] = 0.1 * np.array(astropy.convolution.Gaussian2DKernel(
+        0.75*psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    psf_coeffs[5] = -0.1 * np.array(astropy.convolution.Gaussian2DKernel(
+        0.5*psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    psf_coeffs[3] = -0.5 * (
+        np.array(astropy.convolution.Gaussian2DKernel(
+            1.3*psf_sigma, x_size=psf_size, y_size=psf_size,
+            mode='oversample', factor=5
+            ))
+      - 0.9 * np.array(astropy.convolution.Gaussian2DKernel(
+            1.1*psf_sigma, x_size=psf_size, y_size=psf_size,
+            mode='oversample', factor=5
+        ))
+    )
+    psf_coeffs = normalize_psf_coeffs(psf_coeffs)
+
+    # Generate the stellar postage stamps
+    n_stars = 300
+    (ps_img, ps_weight, ps_mask,
+     x_star, y_star,
+     flux_model, sky_model,
+     ccd_shape) = gen_mock_postage_stamps(psf_coeffs, n_stars,
+                                          flux_max=1.e4,
+                                          mask_prob=0.25,
+                                          max_mask_size=0.25)
+
+    # Need to convert the fluxes into "improper" fluxes (i.e., not a true flux,
+    # but a multiple of the local PSF, which is not necessarily normalized)
+    psf_flux = calc_psf_fluxes(psf_coeffs, x_star, y_star, ccd_shape)
 
     # Fit the PSF coefficients, putting in the correct flux and sky levels
     psf_coeffs_fit = fit_psf_coeffs(
-        flux_model,
+        flux_model / psf_flux,
         sky_model,
         x_star,
         y_star,
@@ -85,10 +205,13 @@ def test_psf_coeff_fit():
             ax.set_xticks([])
             ax.set_yticks([])
 
-    fig.subplots_adjust(hspace=0.01, wspace=0.01)
-    fig.savefig('psf_coeff_fit_test.svg', bbox_inches='tight')
+            if k == 0:
+                txt = ['Truth', 'Fit', 'Residual'][j]
+                ax.set_ylabel(r'$\mathrm{{ {} }}$'.format(txt), fontsize=18)
 
-    return
+    fig.subplots_adjust(hspace=0.01, wspace=0.01)
+    fig.suptitle(r'$\mathrm{PSF \ Fitting \ Test}$', fontsize=18)
+    fig.savefig('mock_data/plots/psf_coeff_fit.svg', bbox_inches='tight')
 
 
 def test_shift_stars():
@@ -102,11 +225,21 @@ def test_shift_stars():
         psf_sigma, x_size=psf_size, y_size=psf_size,
         mode='oversample', factor=5
     ))
+    psf_coeffs[3] = 0.1 * np.array(astropy.convolution.Gaussian2DKernel(
+        0.5*psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
     psf_coeffs = normalize_psf_coeffs(psf_coeffs)
 
     # Generate the stellar postage stamps
     n_stars = 1000
-    ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape = gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=3.e2)
+    (ps_img, ps_weight, ps_mask,
+     x_star, y_star,
+     flux_model, sky_model,
+     ccd_shape) = gen_mock_postage_stamps(psf_coeffs, n_stars,
+                                          flux_max=8.e2,
+                                          mask_prob=0.25,
+                                          max_mask_size=0.1)
 
     # Shift each star
     dx_true = max_shift * (2. * np.random.random(n_stars) - 1.)
@@ -168,7 +301,7 @@ def test_shift_stars():
     ax = fig.add_subplot(1,1,1)
 
     ds_plot = []
-    for n0,n1 in zip([0., 100.], [100., np.inf]):
+    for n0,n1 in zip([0., 100., 200.], [100., 200., np.inf]):
         idx = (flux_model >= n0 * sky_model) & (flux_model < n1 * sky_model)
         ds_plot.append(ds[idx])
 
@@ -176,6 +309,7 @@ def test_shift_stars():
 
     ax.set_xlabel(r'$\Delta s \ \left( \mathrm{pixels} \right)$', fontsize=16)
     ax.set_ylabel(r'$\mathrm{Frequency}$', fontsize=16)
+    ax.set_title(r'$\mathrm{Distance \ from \ True \ Stellar \ Position}$', fontsize=18)
 
     fig.savefig('mock_data/plots/shifted_stars_hist.svg', dpi=120, bbox_inches='tight')
 
@@ -186,7 +320,8 @@ def test_shift_stars():
         for k in range(4):
             ax = fig.add_subplot(4,4,i+1, axisbg='g')
 
-            vmin, vmax = np.percentile(ps_img[i], [1., 99.])
+            idx = (ps_mask[i] < 1.e-5)
+            vmin, vmax = np.percentile(ps_img[i][idx], [1., 99.])
             ax.imshow(ps_img[i].T, origin='lower', aspect='equal',
                                    interpolation='none', cmap='binary',
                                    vmin=vmin, vmax=vmax)
@@ -217,6 +352,7 @@ def test_shift_stars():
             i += 1
 
     fig.subplots_adjust(hspace=0.02, wspace=0.02)
+    fig.suptitle(r'$\mathrm{Star \ Centroiding \ Test}$', fontsize=22, y=0.94)
     fig.savefig('mock_data/plots/shifted_stars.svg', bbox_inches='tight', dpi=120)
 
 
@@ -848,10 +984,11 @@ def test_extract_psf(replace_with_mock=False):
 
 
 def main():
-    #test_psf_coeff_fit()
+    test_psf_coeff_fit()
     #test_extract_psf(replace_with_mock=True)
     #test_gen_data()
-    test_shift_stars()
+    #test_shift_stars()
+    #test_star_fit()
 
     return 0
 
