@@ -48,6 +48,105 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
         return ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape
 
 
+def test_chisq():
+    # Set up the PSF
+    psf_size = 63
+    psf_sigma = 3.
+    psf_coeffs = np.zeros((6,psf_size,psf_size), dtype='f8')
+    psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+        psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+    #psf_coeffs[1] = 0.5 * np.array(astropy.convolution.Gaussian2DKernel(
+    #    0.75*psf_sigma, x_size=psf_size, y_size=psf_size,
+    #    mode='oversample', factor=5
+    #))
+    psf_coeffs = normalize_psf_coeffs(psf_coeffs)
+
+    # Generate the stellar postage stamps
+    n_stars = 10000
+    (ps_img, ps_weight, ps_mask,
+     x_star, y_star,
+     flux_model, sky_model,
+     ccd_shape) = gen_mock_postage_stamps(psf_coeffs, n_stars,
+                                          flux_max=1.e10,
+                                          mask_prob=0.25,
+                                          max_mask_size=0.25)
+
+    # Calculate the chi^2 surfaces for each star
+    star_chisq, chisq_img = calc_star_chisq(
+        psf_coeffs,
+        ps_img, ps_weight, ps_mask,
+        x_star, y_star,
+        flux_model, sky_model,
+        ccd_shape,
+        return_chisq_img=True
+    )
+
+    # Calculate the # of d.o.f. for each star
+    star_dof = np.sum(np.sum(np.isfinite(chisq_img), axis=1), axis=1)
+    dof_eff = np.mean(star_dof)
+
+    # Plot histogram of chi^2
+    fig = plt.figure(figsize=(10,5), dpi=120)
+
+    ax = fig.add_subplot(1,1,1)
+
+    ax.hist(star_chisq, 50, normed=1, histtype='stepfilled')
+
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+
+    x = np.linspace(xlim[0], xlim[1], 1000)
+    y = scipy.stats.chi2.pdf(x*dof_eff, dof_eff)
+    y *= 0.85 * ylim[1] / np.max(y)
+    ax.plot(x, y, 'g-', lw=2., alpha=0.5)
+
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+
+    ax.set_xlabel(r'$\mathrm{Stellar} \ \chi^2$', fontsize=16)
+    ax.set_ylabel(r'$\mathrm{Frequency}$', fontsize=16)
+    ax.set_title(r'$\mathrm{Stellar} \ \chi^2 \ \mathrm{Computation \ Test}$',
+                 fontsize=18)
+
+    fig.savefig('mock_data/plots/chisq_stars_hist.svg', dpi=120, bbox_inches='tight')
+
+    # Plot the chi^2 surfaces
+    vmin, vmax = 0., 3.
+    fig = plt.figure(figsize=(12,12), dpi=120)
+    i = 0
+    sort_idx = np.argsort(star_chisq)
+
+    for j in range(4):
+        for k in range(4):
+            ax = fig.add_subplot(4,4,i+1, axisbg='g')
+
+            ax.imshow(chisq_img[sort_idx[i]].T, origin='lower', aspect='equal',
+                                   interpolation='none', cmap='binary',
+                                   vmin=vmin, vmax=vmax)
+
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+            i += 1
+
+    fig.subplots_adjust(hspace=0.02, wspace=0.02)
+    fig.suptitle(r'$\chi^2 \ \mathrm{Surface \ Test}$', fontsize=22, y=0.94)
+    fig.savefig('mock_data/plots/chisq_surfaces.svg', bbox_inches='tight', dpi=120)
+
+    # Plot chi^2 over the CCD
+    fig = plt.figure(figsize=(12,12), dpi=120)
+    ax = fig.add_subplot(1,1,1)
+    ax.scatter(x_star, y_star, c=star_chisq,
+               cmap='RdYlGn', vmin=0.5, vmax=1.5,
+               s=15., edgecolor='none', alpha=0.5)
+    ax.set_xlim(0, ccd_shape[0])
+    ax.set_ylim(0, ccd_shape[1])
+    fig.suptitle(r'$\chi^2 \ \mathrm{Across \ CCD}$', fontsize=22, y=0.94)
+    fig.savefig('mock_data/plots/chisq_across_CCD.svg', bbox_inches='tight', dpi=120)
+
+
 def test_star_fit():
     # Set up the PSF
     psf_size = 63
@@ -984,7 +1083,8 @@ def test_extract_psf(replace_with_mock=False):
 
 
 def main():
-    test_psf_coeff_fit()
+    test_chisq()
+    #test_psf_coeff_fit()
     #test_extract_psf(replace_with_mock=True)
     #test_gen_data()
     #test_shift_stars()

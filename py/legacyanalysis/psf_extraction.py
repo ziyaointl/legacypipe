@@ -236,18 +236,18 @@ def gen_stellar_flux_predictor(star_flux, star_ps1_mag,
 
     # Calculate corrections to fluxes, by summing the PSF at the location of
     # each star
-    psf_norm = np.empty(n_stars, dtype='f8')
+    # TODO: Verify that no normalization is needed, and remove this code
+    psf_norm = np.ones(n_stars, dtype='f8')#np.empty(n_stars, dtype='f8')
 
-    for k in range(n_stars):
-        # Evaluate the PSF at the location of the star
-        psf_model = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
-        psf_norm[k] = np.sum(psf_model)
+    #for k in range(n_stars):
+    #    # Evaluate the PSF at the location of the star
+    #    psf_model = eval_psf(psf_coeffs, star_x[k], star_y[k], ccd_shape)
+    #    psf_norm[k] = np.sum(psf_model)
 
     #print 'PSF Norm:', psf_norm
 
     star_flux_corr = star_flux * psf_norm
 
-    # TODO: Automatic computation of PSF normalization
     # TODO: Automatic choice of bands to use
 
     # Convert PS1 magnitude to flux, where 20th mag corresponds to a flux of 1
@@ -873,16 +873,26 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     '''
 
     # Generate an image of the PSF at the location of each star
-    x = star_x / float(ccd_shape[0])
-    y = star_y / float(ccd_shape[1])
+    x = 2. * star_x / float(ccd_shape[0]) - 1.
+    y = 2. * star_y / float(ccd_shape[1]) - 1.
 
-    psf_img = np.zeros(ps_exposure.shape, dtype='f8')
+    psf_img = np.zeros(ps_exposure.shape, dtype='f8')   # Shape: (star, x, y)
     psf_img += psf_coeffs[0,None,:,:]
-    psf_img += psf_coeffs[1,None,:,:] * x[:,None,None]
-    psf_img += psf_coeffs[2,None,:,:] * y[:,None,None]
-    psf_img += psf_coeffs[3,None,:,:] * x[:,None,None] * x[:,None,None]
-    psf_img += psf_coeffs[4,None,:,:] * y[:,None,None] * y[:,None,None]
-    psf_img += psf_coeffs[5,None,:,:] * x[:,None,None] * y[:,None,None]
+    psf_img += psf_coeffs[1,None,:,:] * eval_chebyt(1, x)[:,None,None]
+    psf_img += psf_coeffs[2,None,:,:] * eval_chebyt(1, y)[:,None,None]
+    psf_img += psf_coeffs[3,None,:,:] * eval_chebyt(2, x)[:,None,None]
+    psf_img += psf_coeffs[4,None,:,:] * eval_chebyt(2, y)[:,None,None]
+    psf_img += psf_coeffs[5,None,:,:] * (eval_chebyt(1, x)*eval_chebyt(1, y))[:,None,None]
+
+    # Normalize each PSF to unity
+    psf_norm = 1. / np.sum(np.sum(psf_img, axis=1), axis=1)
+    psf_img *= psf_norm[:,None,None]
+
+    #import matplotlib.pyplot as plt
+    #fig = plt.figure(figsize=(12,12), dpi=120)
+    #ax = fig.add_subplot(1,1,1)
+    #ax.scatter(x, y, c=1./psf_norm, cmap='RdYlGn', vmin=0.7, vmax=1.3, s=15., edgecolor='none')
+    #plt.show()
 
     # Transform the PSF into a model of counts
     psf_img *= star_flux[:,None,None]
@@ -891,7 +901,12 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     # Calculate an image of chi^2 of each star
     chisq_img = ps_exposure - psf_img
     chisq_img *= chisq_img * ps_weight
-    chisq_img[(ps_mask != 0) | ~np.isfinite(chisq_img)] = 0.
+    print '# of non-finite ps_weight pixels:', np.sum(~np.isfinite(ps_weight))
+    print '# of non-finite ps_exposure pixels:', np.sum(~np.isfinite(ps_exposure))
+    print '# of non-finite psf_img pixels:', np.sum(~np.isfinite(psf_img))
+
+    idx_mask = (ps_mask >= 1.e-5) | ~np.isfinite(chisq_img)
+    chisq_img[idx_mask] = 0.
 
     # Calculate chi^2/dof for each star
     chisq = np.sum(np.sum(chisq_img, axis=1), axis=1)
@@ -899,6 +914,7 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     chisq /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
 
     if return_chisq_img:
+        chisq_img[idx_mask] = np.nan
         return chisq, chisq_img
 
     return chisq
@@ -1008,7 +1024,8 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     n_stars = ps_exposure.shape[0]
     psf_coeffs = np.zeros((6, ps_exposure.shape[1], ps_exposure.shape[2]), dtype='f8')
     psf_coeffs[0,:,:] = psf_guess[:,:]
-    stellar_flux = np.empty(n_stars, dtype='f8')
+    stellar_flux = np.empty(n_stars, dtype='f8')            # The true flux
+    stellar_flux_improper = np.empty(n_stars, dtype='f8')   # Flux defined as a multiple of the PSF (which may be unnormalized)
     sky_level = np.empty(n_stars, dtype='f8')
     stellar_flux[:] = np.nan
     sky_level[:] = np.nan
@@ -1043,6 +1060,10 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
                 stellar_flux_mean=stellar_flux_mean[k],
                 stellar_flux_sigma=stellar_flux_sigma[k]
             )
+
+        # Calculate the "improper" fluxes (defined in unnormalized PSF units)
+        psf_flux = calc_psf_fluxes(psf_coeffs, star_x, star_y, ccd_shape)
+        stellar_flux_improper = stellar_flux / psf_flux
 
         # Flag stars with bad chi^2/dof
         star_chisq, star_chisq_img = calc_star_chisq(
@@ -1105,7 +1126,7 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
         else:
             ps_mask_effective = ps_mask[idx]
 
-        psf_coeffs = fit_psf_coeffs(stellar_flux[idx], sky_level[idx],
+        psf_coeffs = fit_psf_coeffs(stellar_flux_improper[idx], sky_level[idx],
                                     star_x[idx], star_y[idx],
                                     ccd_shape, ps_exposure[idx],
                                     ps_weight[idx], ps_mask_effective,
