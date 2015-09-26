@@ -9,7 +9,8 @@ from psf_extraction import *
 
 
 def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
-                            mask_prob=0.25, max_mask_size=0.25):
+                            mask_prob=0.25, max_mask_size=0.25,
+                            x_star=None, y_star=None):
         # Set up the PSF
         assert (psf_coeffs.shape[1] == psf_coeffs.shape[2])
         psf_size = psf_coeffs.shape[1]
@@ -18,8 +19,12 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
         # Generate the stellar postage stamps
         ccd_shape = (4000,2000)
         flux_background = 10.
-        x_star = ccd_shape[0] * np.random.random(n_stars)
-        y_star = ccd_shape[1] * np.random.random(n_stars)
+
+        if x_star == None:
+            x_star = ccd_shape[0] * np.random.random(n_stars)
+        if y_star == None:
+            y_star = ccd_shape[1] * np.random.random(n_stars)
+
         flux_model = flux_max * flux_background * np.random.random(n_stars)
         sky_model = np.random.normal(loc=flux_background,
                                      scale=np.sqrt(flux_background),
@@ -32,7 +37,10 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
             psf_local /= np.sum(psf_local)
             ps_img[k] = sky_model[k] + flux_model[k] * psf_local
 
-        ps_weight = 1. / ps_img                         # Poisson statistics
+        sigma2 = np.abs(ps_img)     # Poisson statistics
+        sigma2[sigma2 < 1.] = 1.    # Floor on the variance
+
+        ps_weight = 1. / sigma2
         ps_mask = np.zeros(ps_img.shape, dtype='f8')    # No masked pixels
 
         idx_star_mask = np.where(np.random.random(n_stars) < mask_prob)[0]
@@ -42,13 +50,16 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
             i1 = int(np.ceil(0.5 * (psf_size + w))) + 1
             ps_mask[k,i0:i1,i0:i1] = 1.
 
-        # Add in poisson noise to the image
-        ps_img += np.sqrt(ps_img) * np.random.normal(loc=0., scale=1., size=ps_img.shape)
+        # Add in Poisson noise to the image
+        ps_img += np.sqrt(sigma2) * np.random.normal(loc=0., scale=1., size=ps_img.shape)
 
         return ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape
 
 
-def test_chisq():
+def test_chisq(add_secondary_sources=False):
+    plt_suffix = '_bad' if add_secondary_sources else ''
+    title_suffix = r'\ \left( bad \right)' if add_secondary_sources else ''
+
     # Set up the PSF
     psf_size = 63
     psf_sigma = 3.
@@ -72,6 +83,41 @@ def test_chisq():
                                           flux_max=1.e10,
                                           mask_prob=0.25,
                                           max_mask_size=0.25)
+
+    # Add in secondary sources
+    if add_secondary_sources:
+        #res_tmp = gen_mock_postage_stamps(psf_coeffs, n_stars,
+        #                                  flux_max=1.e10,
+        #                                  mask_prob=0.,
+        #                                  max_mask_size=0.,
+        #                                  x_star=x_star,
+        #                                  y_star=y_star)
+
+        offset = psf_size * (np.random.random((n_stars,2)) - 0.5)
+
+        for k,(dx,dy) in enumerate(offset):
+            #print dx, dy
+            #mult = 0.1 * flux_model[k] / res_tmp[5][k]
+            #ps_img[k] += sinc_shift_image(res_tmp[0][k], dx, dy) * mult
+            #s2_tmp = sinc_shift_image(1./res_tmp[1][k], dx, dy) * mult**2.
+            #ps_weight[k] = 1. / (1./ps_weight[k] + s2_tmp)
+            #ps_img[k] = sinc_shift_image(res_tmp[0][k], dx, dy)
+            #ps_weight[k] = w_tmp
+
+            sec_tmp = np.array(astropy.convolution.Gaussian2DKernel(
+                psf_sigma, x_size=psf_size, y_size=psf_size,
+                mode='oversample', factor=5
+            ))
+            sec_tmp *= 0.1 * np.random.random() / np.sum(sec_tmp) * flux_model[k]
+            sec_tmp = sinc_shift_image(sec_tmp, dx, dy)
+
+            s2_tmp = np.abs(sec_tmp)
+            s2_tmp[s2_tmp < 1.e-5] = 1.e-5
+
+            sec_tmp += np.sqrt(s2_tmp) * np.random.normal(loc=0., scale=1., size=sec_tmp.shape)
+            ps_weight[k] = 1. / (1./ps_weight[k] + s2_tmp)
+            ps_img[k] += sec_tmp
+
 
     # Calculate the chi^2 surfaces for each star
     star_chisq, chisq_img = calc_star_chisq(
@@ -107,24 +153,49 @@ def test_chisq():
 
     ax.set_xlabel(r'$\mathrm{Stellar} \ \chi^2$', fontsize=16)
     ax.set_ylabel(r'$\mathrm{Frequency}$', fontsize=16)
-    ax.set_title(r'$\mathrm{Stellar} \ \chi^2 \ \mathrm{Computation \ Test}$',
+    ax.set_title(r'$\mathrm{{Stellar}} \ \chi^2 \ \mathrm{{Computation \ Test {} }}$'.format(title_suffix),
                  fontsize=18)
 
-    fig.savefig('mock_data/plots/chisq_stars_hist.svg', dpi=120, bbox_inches='tight')
+    fig.savefig('mock_data/plots/chisq{}_stars_hist.svg'.format(plt_suffix),
+                dpi=120, bbox_inches='tight')
 
     # Plot the chi^2 surfaces
-    vmin, vmax = 0., 3.
+    vmin, vmax = 0., 2.
     fig = plt.figure(figsize=(12,12), dpi=120)
     i = 0
-    sort_idx = np.argsort(star_chisq)
+    sort_idx = np.arange(n_stars)#np.argsort(star_chisq)
 
     for j in range(4):
         for k in range(4):
             ax = fig.add_subplot(4,4,i+1, axisbg='g')
 
-            ax.imshow(chisq_img[sort_idx[i]].T, origin='lower', aspect='equal',
-                                   interpolation='none', cmap='binary',
-                                   vmin=vmin, vmax=vmax)
+
+            tmp = chisq_img[sort_idx[i]]
+            tmp[tmp > 5.] = np.nan
+            #vmin, vmax = np.percentile(np.abs(tmp[np.isfinite(tmp)]), [0.5, 99.5])
+            #print vmax
+            ax.imshow(tmp.T, origin='lower', aspect='equal',
+                      interpolation='none', cmap='bwr',
+                      vmin=vmin, vmax=vmax)
+
+            '''
+            tmp = np.abs(ps_weight[i][np.isfinite(ps_weight[i])])
+            vmin, vmax = np.percentile(tmp, [1., 99.5])
+            print vmin, vmax
+            ax.imshow(np.log(ps_weight[sort_idx[i]].T),
+                      origin='lower', aspect='equal',
+                      interpolation='none', cmap='bwr_r',
+                      vmin=np.log(vmin), vmax=np.log(vmax))
+            '''
+
+            '''
+            tmp = np.abs(ps_img[i][np.isfinite(ps_img[i])])
+            vmin, vmax = np.percentile(tmp, [1., 99.5])
+            ax.imshow(ps_img[sort_idx[i]].T,
+                      origin='lower', aspect='equal',
+                      interpolation='none', cmap='bwr_r',
+                      vmin=-vmax, vmax=vmax)
+            '''
 
             ax.set_xticks([])
             ax.set_yticks([])
@@ -132,19 +203,23 @@ def test_chisq():
             i += 1
 
     fig.subplots_adjust(hspace=0.02, wspace=0.02)
-    fig.suptitle(r'$\chi^2 \ \mathrm{Surface \ Test}$', fontsize=22, y=0.94)
-    fig.savefig('mock_data/plots/chisq_surfaces.svg', bbox_inches='tight', dpi=120)
+    fig.suptitle(r'$\chi^2 \ \mathrm{{Surface \ Test {} }}$'.format(title_suffix), fontsize=22, y=0.94)
+    fig.savefig('mock_data/plots/chisq{}_surfaces.svg'.format(plt_suffix),
+                bbox_inches='tight', dpi=120)
 
     # Plot chi^2 over the CCD
-    fig = plt.figure(figsize=(12,12), dpi=120)
+    fig = plt.figure(figsize=(12,6.5), dpi=120)
     ax = fig.add_subplot(1,1,1)
     ax.scatter(x_star, y_star, c=star_chisq,
-               cmap='RdYlGn', vmin=0.5, vmax=1.5,
+               cmap='RdYlGn_r', vmin=0.75, vmax=1.25,
                s=15., edgecolor='none', alpha=0.5)
     ax.set_xlim(0, ccd_shape[0])
     ax.set_ylim(0, ccd_shape[1])
-    fig.suptitle(r'$\chi^2 \ \mathrm{Across \ CCD}$', fontsize=22, y=0.94)
-    fig.savefig('mock_data/plots/chisq_across_CCD.svg', bbox_inches='tight', dpi=120)
+    fig.subplots_adjust(top=0.92)
+    fig.suptitle(r'$\chi^2 \ \mathrm{{Across \ CCD {} }}$'.format(title_suffix),
+                 fontsize=22, y=0.94, va='bottom')
+    fig.savefig('mock_data/plots/chisq{}_across_CCD.svg'.format(plt_suffix),
+                bbox_inches='tight', dpi=120)
 
 
 def test_star_fit():
@@ -488,15 +563,6 @@ def gen_test_data(psf_coeffs, sky_level=100., limiting_mag=24., band=3):
     ps1_table = astropy.io.fits.getdata(fname, 1)
     star_x, star_y, ps1_mag = get_star_locations(ps1_table, wcs, img_data.shape, min_separation=1.)
 
-    # Clip to stars that fall on the CCD
-    #idx = ( (star_x > -psf_shape[0]) & (star_x < ccd_shape[0]+psf_shape[0])
-    #      & (star_y > -psf_shape[1]) & (star_y < ccd_shape[1]+psf_shape[1]) )
-
-    #idx = np.arange(10)
-    #star_x = star_x[idx]
-    #star_y = star_y[idx]
-    #ps1_table = ps1_table[idx]
-
     # Transform stellar magnitudes to fluxes
     limiting_mag_flux = 5. * np.sqrt(sky_level)
     star_flux = limiting_mag_flux * 10.**(-0.4 * (ps1_mag[:,band]-limiting_mag))
@@ -534,11 +600,15 @@ def gen_test_data(psf_coeffs, sky_level=100., limiting_mag=24., band=3):
     # Clip the image
     img_mean = img_mean[psf_shape[0]:-psf_shape[0], psf_shape[1]:-psf_shape[1]]
 
+    # Poisson statistics
+    sigma2 = np.abs(img_mean)
+    #sigma2[sigma2 < 0.1] = 0.1    # Floor on variance
+
     # Add noise into the image
-    img_model = img_mean + np.sqrt(img_mean) * np.random.normal(loc=0., scale=1., size=ccd_shape)
+    img_model = img_mean + np.sqrt(sigma2) * np.random.normal(loc=0., scale=1., size=ccd_shape)
 
     # Calculate the weights (assume Poisson statistics)
-    weight_model = 1. / img_mean
+    weight_model = 1. / sigma2
 
     # Copy the mask
     mask_model = np.empty(ccd_shape, dtype='f8')
@@ -620,11 +690,11 @@ def test_extract_psf(replace_with_mock=False):
             mode='oversample', factor=5
         ))
         psf_coeffs_model[0] += 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
-            1.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+            0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
             mode='oversample', factor=5
         ))
-        psf_coeffs_model[1] = 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
-            1.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+        psf_coeffs_model[1] = -0.25 * np.array(astropy.convolution.Gaussian2DKernel(
+            0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
             mode='oversample', factor=5
         ))
 
@@ -657,36 +727,27 @@ def test_extract_psf(replace_with_mock=False):
     #print ''
 
     # Calculate the residuals
-    psf_resid = calc_star_chisq(psf_coeffs, star_dict['ps_exposure'],
-                                star_dict['ps_weight'], star_dict['ps_mask'],
-                                star_dict['star_x'], star_dict['star_y'],
-                                star_dict['stellar_flux'], star_dict['sky_level'],
-                                ccd_shape)
+    psf_resid = calc_star_chisq(
+        psf_coeffs, star_dict['ps_exposure'],
+        star_dict['ps_weight'], star_dict['ps_mask'],
+        star_dict['star_x'], star_dict['star_y'],
+        star_dict['stellar_flux'], star_dict['sky_level'],
+        ccd_shape
+    )
 
-    # Calculate the shift for each star
-    '''
-    print 'Fitting star offsets:'
-    for k in range(len(star_dict['ps_exposure'])):
-        print 'Star {: 3d}'.format(k)
-        print '========\n'
-
-        dx,dy = fit_star_offset(psf_coeffs, star_dict['ps_exposure'][k],
-                                star_dict['ps_weight'][k], star_dict['ps_mask'][k],
-                                star_dict['star_x'][k], star_dict['star_y'][k],
-                                star_dict['stellar_flux'][k], star_dict['sky_level'][k],
-                                ccd_shape, max_shift=5.)
-
-        print 'dx,dy = ({:.3f}, {:.3f})\n\n'.format(dx, dy)
-    '''
+    tmp = star_dict['ps_exposure'] * star_dict['ps_weight']
+    tmp.shape = (tmp.shape[0], tmp.shape[1]*tmp.shape[2])
+    print 'Exposure * weight:'
+    print np.median(tmp, axis=1)
+    print ''
 
     # Calculate corrections to fluxes, by normalizing PSFs
-    psf_norm = np.empty(n_stars, dtype='f8')
-
-    for k in range(n_stars):
-        # Evaluate the PSF at the location of the star
-        psf_model = eval_psf(psf_coeffs, star_dict['star_x'][k],
-                             star_dict['star_y'][k], ccd_shape)
-        psf_norm[k] = np.sum(psf_model)
+    #psf_norm = np.empty(n_stars, dtype='f8')
+    #for k in range(n_stars):
+    #    # Evaluate the PSF at the location of the star
+    #    psf_model = eval_psf(psf_coeffs, star_dict['star_x'][k],
+    #                         star_dict['star_y'][k], ccd_shape)
+    #    #psf_norm[k] = np.sum(psf_model)
 
     #star_dict['stellar_flux'] *= psf_norm
 
@@ -694,7 +755,7 @@ def test_extract_psf(replace_with_mock=False):
     fig = plt.figure(figsize=(16,8), dpi=100)
 
     ps1_flux = 10.**(-(star_dict['star_ps1_mag']-20.) / 2.5)
-    fit_flux = star_dict['stellar_flux'] * psf_norm
+    fit_flux = star_dict['stellar_flux']
     fit_mag = -2.5 * np.log10(fit_flux)
 
     idx_ps1_good = (star_dict['star_ps1_mag'][:,3] > 10.) & (star_dict['star_ps1_mag'][:,3] < 25.)
@@ -963,6 +1024,7 @@ def test_extract_psf(replace_with_mock=False):
         # Evaluate the PSF at the location of the star
         psf_model = eval_psf(psf_coeffs, star_dict['star_x'][k],
                              star_dict['star_y'][k], ccd_shape)
+        psf_model /= np.sum(psf_model)
 
         #print ''
         #print 'norm = {:5f}'.format(np.sum(psf_model))
@@ -1083,9 +1145,9 @@ def test_extract_psf(replace_with_mock=False):
 
 
 def main():
-    test_chisq()
+    #test_chisq(add_secondary_sources=True)
     #test_psf_coeff_fit()
-    #test_extract_psf(replace_with_mock=True)
+    test_extract_psf(replace_with_mock=True)
     #test_gen_data()
     #test_shift_stars()
     #test_star_fit()

@@ -677,7 +677,6 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
     sky_level = np.zeros(n_stars, dtype='f8')
 
     # Extract each star
-
     for i, (sj0,sj1,sk0,sk1,dj0,dj1,dk0,dk1) in enumerate(zip(src_j0,src_j1,
                                                               src_k0,src_k1,
                                                               dst_j0,dst_j1,
@@ -700,17 +699,13 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
         if np.all(~idx_use):
             continue
 
-        # Find non-center pixels
-        #s = idx_use.shape
-        #idx_noncenter = np.ones(s, dtype=np.bool)
-        #idx_noncenter[s[0]/4:3*s[0]/4, s[1]/4:int(3./4.*s[1])]
-
         # Copy star into postage stamp stack
         ps_stack[0,i,dj0:dj1,dk0:dk1] = tmp_exposure - np.median(tmp_exposure[idx_use])
         ps_stack[0,i] = sinc_shift_image(ps_stack[0,i], dx[i], dy[i])
 
         ps_stack[1,i] = np.median(tmp_weight[idx_use])
         ps_stack[1,i,dj0:dj1,dk0:dk1] = tmp_weight
+        #ps_stack[1,i] = 1. / sinc_shift_image(1./ps_stack[1,i], dx[i], dy[i])   # Shift 1/weight, b/c better behaved
         ps_stack[1,i] = sinc_shift_image(ps_stack[1,i], dx[i], dy[i])
 
         ps_stack[2,i,dj0:dj1,dk0:dk1] = tmp_mask
@@ -888,12 +883,6 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     psf_norm = 1. / np.sum(np.sum(psf_img, axis=1), axis=1)
     psf_img *= psf_norm[:,None,None]
 
-    #import matplotlib.pyplot as plt
-    #fig = plt.figure(figsize=(12,12), dpi=120)
-    #ax = fig.add_subplot(1,1,1)
-    #ax.scatter(x, y, c=1./psf_norm, cmap='RdYlGn', vmin=0.7, vmax=1.3, s=15., edgecolor='none')
-    #plt.show()
-
     # Transform the PSF into a model of counts
     psf_img *= star_flux[:,None,None]
     psf_img += sky_level[:,None,None]
@@ -901,9 +890,6 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     # Calculate an image of chi^2 of each star
     chisq_img = ps_exposure - psf_img
     chisq_img *= chisq_img * ps_weight
-    print '# of non-finite ps_weight pixels:', np.sum(~np.isfinite(ps_weight))
-    print '# of non-finite ps_exposure pixels:', np.sum(~np.isfinite(ps_exposure))
-    print '# of non-finite psf_img pixels:', np.sum(~np.isfinite(psf_img))
 
     idx_mask = (ps_mask >= 1.e-5) | ~np.isfinite(chisq_img)
     chisq_img[idx_mask] = 0.
@@ -912,6 +898,11 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     chisq = np.sum(np.sum(chisq_img, axis=1), axis=1)
     n_pix = np.sum(np.sum((ps_mask == 0).astype('f8'), axis=1), axis=1)
     chisq /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
+
+    print ''
+    print 'n_pix:'
+    print n_pix
+    print ''
 
     if return_chisq_img:
         chisq_img[idx_mask] = np.nan
