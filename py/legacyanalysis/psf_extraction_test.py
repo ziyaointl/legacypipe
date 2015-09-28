@@ -689,26 +689,29 @@ def test_extract_psf(replace_with_mock=False):
             psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
             mode='oversample', factor=5
         ))
-        psf_coeffs_model[0] += 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
-            0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
-            mode='oversample', factor=5
-        ))
-        psf_coeffs_model[1] = -0.25 * np.array(astropy.convolution.Gaussian2DKernel(
-            0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
-            mode='oversample', factor=5
-        ))
+        #psf_coeffs_model[0] += 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
+        #    0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+        #    mode='oversample', factor=5
+        #))
+        #psf_coeffs_model[1] = -0.25 * np.array(astropy.convolution.Gaussian2DKernel(
+        #    0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+        #    mode='oversample', factor=5
+        #))
 
-        img_data, weight_data, mask_data, star_x, star_y  = gen_test_data(psf_coeffs_model)
+        img_data, weight_data, mask_data, star_x, star_y  = gen_test_data(
+            psf_coeffs_model,
+            limiting_mag = 24.
+        )
         mask_data[:] = 0
 
     print '# of masked pixels:', np.sum(mask_data != 0)
 
     # Extract the PSF
     psf_coeffs, star_dict = extract_psf(img_data, weight_data, mask_data, wcs,
-                                        return_postage_stamps=True, n_iter=8,
-                                        min_pixel_fraction=0.75,
-                                        star_chisq_threshold=10.,
-                                        sky_sigma=0.05,
+                                        return_postage_stamps=True, n_iter=9,
+                                        min_pixel_fraction=0.999999,
+                                        star_chisq_threshold=3.,
+                                        sky_sigma=1.e9,#0.05,
                                         sigma_nonzero_order=1.)
 
     n_stars = star_dict['ps_exposure'].shape[0]
@@ -951,10 +954,10 @@ def test_extract_psf(replace_with_mock=False):
                   vmin=-ps_vmax[-1], vmax=ps_vmax[-1])
 
         tmp = (star_dict['ps_chisq_mask'][k] == 0).astype('f8')
-        tmp[tmp < 0.01] = np.nan
+        tmp[tmp > 0.01] = np.nan
 
         ax.imshow(tmp.T, origin='upper', aspect='equal',
-                  interpolation='nearest', cmap='winter',
+                  interpolation='nearest', cmap='winter_r',
                   vmin=0., vmax=1., alpha=0.25)
 
         xlim = ax.get_xlim()
@@ -1145,9 +1148,9 @@ def test_extract_psf(replace_with_mock=False):
 
 
 def main():
-    #test_chisq(add_secondary_sources=True)
+    #test_chisq(add_secondary_sources=False)
     #test_psf_coeff_fit()
-    test_extract_psf(replace_with_mock=True)
+    test_extract_psf(replace_with_mock=False)
     #test_gen_data()
     #test_shift_stars()
     #test_star_fit()
