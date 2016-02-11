@@ -617,7 +617,7 @@ def gen_test_data(psf_coeffs, sky_level=100., limiting_mag=24., band=3):
     fname = 'psftest/ps1stars-c4d_150109_051822.fits'
     ps1_table = astropy.io.fits.getdata(fname, 1)
     star_x, star_y, ps1_mag = get_star_locations(ps1_table, wcs, img_data.shape, min_separation=1.)
-    
+
     #star_x = star_x[:100]
     #star_y = star_y[:100]
     #ps1_mag = ps1_mag[:100]
@@ -790,6 +790,33 @@ def test_extract_psf(replace_with_mock=False):
                                         star_chisq_threshold=3.,
                                         sky_sigma=1.e9,#0.05,
                                         sigma_nonzero_order=1.)
+
+    # Dump inputs and results to FITS files
+    hdulist = [pyfits.PrimaryHDU()]
+    hdulist += [pyfits.ImageHDU(data=img) for img in star_dict['ps_exposure']]
+    pyfits.HDUList(hdulist).writeto('ps_img.fits', clobber=True)
+
+    hdulist = [pyfits.PrimaryHDU()]
+    hdulist += [pyfits.ImageHDU(data=img) for img in star_dict['ps_weight']]
+    pyfits.HDUList(hdulist).writeto('ps_weight.fits', clobber=True)
+
+    hdulist = [pyfits.PrimaryHDU()]
+    hdulist += [pyfits.ImageHDU(data=img) for img in star_dict['ps_mask']]
+    pyfits.HDUList(hdulist).writeto('ps_mask.fits', clobber=True)
+
+    hdulist = [pyfits.PrimaryHDU()]
+    hdulist += [pyfits.ImageHDU(data=img) for img in psf_coeffs]
+    pyfits.HDUList(hdulist).writeto('psf_coeffs.fits', clobber=True)
+
+    hdulist = [pyfits.PrimaryHDU()]
+    hdulist += [pyfits.BinTableHDU.from_columns([
+        pyfits.Column(name='star_x', format='D', array=star_dict['star_x']),
+        pyfits.Column(name='star_y', format='D', array=star_dict['star_y']),
+        pyfits.Column(name='ps1_z', format='D', array=star_dict['star_ps1_mag'][:,3]),
+        pyfits.Column(name='stellar_flux', format='D', array=star_dict['stellar_flux']),
+        pyfits.Column(name='sky_level', format='D', array=star_dict['sky_level'])
+    ])]
+    pyfits.HDUList(hdulist).writeto('stellar_params.fits', clobber=True)
 
     weight_sum_mid = np.sum(np.sum(weight_data, axis=0), axis=0)
 
