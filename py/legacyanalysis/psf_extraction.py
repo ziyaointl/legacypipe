@@ -131,6 +131,27 @@ def recenter_postage_stamps(exposure_img, weight_img, mask_img, star_x, star_y,
 
     return ret
 
+def center_psf_coeffs(psf_coeffs):
+    '''
+    Return a centered version of the PSF coefficents. In detail, the PSF is
+    sinc-shifted so that when it is, so that the center of mass of the PSF
+    (evaluated at the center of the CCD) is the center of the image.
+    '''
+
+    # Use the zeroeth-order term to center the image
+    dx, dy = scipy.ndimage.measurements.center_of_mass(psf_coeffs[0])
+
+    nx, ny = psf_coeffs.shape[1:]
+
+    dx -= 0.5 * (nx - 1.)
+    dy -= 0.5 * (ny - 1.)
+
+    psf_coeffs_centered = np.empty(psf_coeffs.shape, dtype=psf_coeffs.dtype)
+
+    for k in range(psf_coeffs.shape[0]):
+        psf_coeffs_centered[k] = sinc_shift_image(psf_coeffs[k], -dx, -dy)
+
+    return psf_coeffs_centered, (-dx, -dy)
 
 def sinc_shift_image(img, dx, dy, roll_int=True):
     '''
@@ -715,8 +736,8 @@ def extract_stars(exposure_img, weight_img, mask_img, star_x, star_y,
 
         ps_stack[1,i] = np.median(tmp_weight[idx_use])
         ps_stack[1,i,dj0:dj1,dk0:dk1] = tmp_weight
-        #ps_stack[1,i] = 1. / sinc_shift_image(1./ps_stack[1,i], dx[i], dy[i])   # Shift 1/weight, b/c better behaved
-        ps_stack[1,i] = sinc_shift_image(ps_stack[1,i], dx[i], dy[i])
+        ps_stack[1,i] = 1. / sinc_shift_image(1./ps_stack[1,i], dx[i], dy[i])   # Shift 1/weight, b/c better behaved
+        #ps_stack[1,i] = sinc_shift_image(ps_stack[1,i], dx[i], dy[i])
 
         ps_stack[2,i,dj0:dj1,dk0:dk1] = tmp_mask
         ps_stack[2,i] = astropy.convolution.convolve(ps_stack[2,i], kern, boundary='extend')
@@ -796,6 +817,9 @@ def get_star_locations(ps1_table, wcs, ccd_shape, min_separation=10./0.263):
 
     # Filter stars that don't pass quality cuts
     idx &= filter_ps1_quality(ps1_table)
+
+    # Keep only brightest stars (for testing) TODO: remove this
+    idx &= (ps1_table['MEAN'][:,3] < 14.)
 
     return star_x[idx], star_y[idx], ps1_table['MEAN'][idx]
 
@@ -910,10 +934,10 @@ def calc_star_chisq(psf_coeffs, ps_exposure, ps_weight, ps_mask,
     n_pix = np.sum(np.sum((ps_mask == 0).astype('f8'), axis=1), axis=1)
     chisq /= n_pix #float(ps_exposure.shape[1] * ps_exposure.shape[2])
 
-    #print ''
-    #print 'n_pix:'
-    #print n_pix
-    #print ''
+    print ''
+    print 'n_pix:'
+    print n_pix
+    print ''
 
     if return_chisq_img:
         chisq_img[idx_mask] = np.nan
@@ -1050,6 +1074,7 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
     #star_chisq_threshold_iter = np.linspace(10. * star_chisq_threshold, star_chisq_threshold, n_iter)
 
     # Iterate linear fits to reach the solution
+    n_iter = 1
     for j in range(n_iter):
         print ''
         print '============'
@@ -1151,6 +1176,7 @@ def extract_psf(exposure_img, weight_img, mask_img, wcs,
                                     sigma_nonzero_order=sigma_tmp)
 
         # Normalize the PSF
+        # TODO: Should this go after the recentering step?
         psf_coeffs = normalize_psf_coeffs(psf_coeffs)
 
         if j > 1:

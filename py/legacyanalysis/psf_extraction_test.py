@@ -55,6 +55,61 @@ def gen_mock_postage_stamps(psf_coeffs, n_stars, flux_max=100.,
 
         return ps_img, ps_weight, ps_mask, x_star, y_star, flux_model, sky_model, ccd_shape
 
+def test_center_psf_coeffs():
+    # Set up the PSF
+    psf_size = 63
+    psf_sigma = 3.
+    psf_coeffs = np.zeros((6,psf_size,psf_size), dtype='f8')
+    psf_coeffs[0] = np.array(astropy.convolution.Gaussian2DKernel(
+        psf_sigma, x_size=psf_size, y_size=psf_size,
+        mode='oversample', factor=5
+    ))
+
+    # Shift the PSF
+    dx = 10. * (np.random.random() - 0.5)
+    dy = 10. * (np.random.random() - 0.5)
+    #dx, dy = (0.1, 0.)
+
+    psf_coeffs_shifted = np.empty(psf_coeffs.shape, dtype='f8')
+
+    for k in range(psf_coeffs.shape[0]):
+        psf_coeffs_shifted[k] = sinc_shift_image(psf_coeffs[k], dx, dy)
+
+    psf_coeffs_centered, (dx_fit, dy_fit) = center_psf_coeffs(psf_coeffs_shifted)
+
+    print ''
+    print 'PSF centering results:'
+    print 'dx_true = {:.5f}'.format(dx)
+    print 'dx_fit  = {:.5f}'.format(dx_fit)
+    print 'dy_true = {:.5f}'.format(dy)
+    print 'dy_fit  = {:.5f}'.format(dy_fit)
+    print ''
+
+
+    fig = plt.figure()
+
+    ax = fig.add_subplot(1,3,1)
+    ax.set_title(r'$\mathrm{true}$')
+    ax.imshow(psf_coeffs[0].T, origin='lower',
+              vmin=0., vmax=np.max(psf_coeffs[0]),
+              cmap='Greys', interpolation='nearest')
+
+    ax = fig.add_subplot(1,3,2)
+    ax.set_title(r'$\mathrm{shifted \ - \ true}$')
+    img = psf_coeffs_shifted[0] - psf_coeffs[0]
+    vmax = np.max(np.abs(img))
+    ax.imshow(img.T, origin='lower',
+              vmin=-vmax, vmax=vmax,
+              cmap='bwr_r', interpolation='nearest')
+
+    ax = fig.add_subplot(1,3,3)
+    ax.set_title(r'$\mathrm{centered \ - \ true}$')
+    img = psf_coeffs_centered[0] - psf_coeffs[0]
+    ax.imshow(img.T, origin='lower',
+              vmin=-vmax, vmax=vmax,
+              cmap='bwr_r', interpolation='nearest')
+
+    plt.show()
 
 def test_chisq(add_secondary_sources=False):
     plt_suffix = '_bad' if add_secondary_sources else ''
@@ -562,6 +617,10 @@ def gen_test_data(psf_coeffs, sky_level=100., limiting_mag=24., band=3):
     fname = 'psftest/ps1stars-c4d_150109_051822.fits'
     ps1_table = astropy.io.fits.getdata(fname, 1)
     star_x, star_y, ps1_mag = get_star_locations(ps1_table, wcs, img_data.shape, min_separation=1.)
+    
+    #star_x = star_x[:100]
+    #star_y = star_y[:100]
+    #ps1_mag = ps1_mag[:100]
 
     # Transform stellar magnitudes to fluxes
     limiting_mag_flux = 5. * np.sqrt(sky_level)
@@ -689,6 +748,21 @@ def test_extract_psf(replace_with_mock=False):
             psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
             mode='oversample', factor=5
         ))
+
+        # x-dependent term
+        #psf_coeffs_model[1] = np.array(astropy.convolution.Gaussian2DKernel(
+        #    0.75*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+        #    mode='oversample', factor=5
+        #))
+        #psf_coeffs_model[1] *= 0.50 * np.max(psf_coeffs_model[0]) / np.max(psf_coeffs_model[1])
+
+        # y-dependent term
+        #psf_coeffs_model[2] = np.array(astropy.convolution.Gaussian2DKernel(
+        #    1.25*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
+        #    mode='oversample', factor=5
+        #))
+        #psf_coeffs_model[2] *= 0.1 * np.max(psf_coeffs_model[0]) / np.max(psf_coeffs_model[2])
+
         #psf_coeffs_model[0] += 0.25 * np.array(astropy.convolution.Gaussian2DKernel(
         #    0.5*psf_sigma, x_size=psf_coeffs_model.shape[1], y_size=psf_coeffs_model.shape[2],
         #    mode='oversample', factor=5
@@ -704,6 +778,9 @@ def test_extract_psf(replace_with_mock=False):
         )
         mask_data[:] = 0
 
+    print weight_data.shape
+    weight_sum_init = np.sum(np.sum(weight_data, axis=0), axis=0)
+
     print '# of masked pixels:', np.sum(mask_data != 0)
 
     # Extract the PSF
@@ -713,6 +790,8 @@ def test_extract_psf(replace_with_mock=False):
                                         star_chisq_threshold=3.,
                                         sky_sigma=1.e9,#0.05,
                                         sigma_nonzero_order=1.)
+
+    weight_sum_mid = np.sum(np.sum(weight_data, axis=0), axis=0)
 
     n_stars = star_dict['ps_exposure'].shape[0]
     ccd_shape = img_data.shape
@@ -737,6 +816,12 @@ def test_extract_psf(replace_with_mock=False):
         star_dict['stellar_flux'], star_dict['sky_level'],
         ccd_shape
     )
+
+    weight_sum_final = np.sum(np.sum(weight_data, axis=0), axis=0)
+
+    print ''
+    print 'Sum of weights: {:.10f} {:.10f} {:.10f}'.format(weight_sum_init, weight_sum_mid, weight_sum_final)
+    print ''
 
     tmp = star_dict['ps_exposure'] * star_dict['ps_weight']
     tmp.shape = (tmp.shape[0], tmp.shape[1]*tmp.shape[2])
@@ -850,15 +935,18 @@ def test_extract_psf(replace_with_mock=False):
     plt.close(fig)
 
     # Plot the PSF coefficients
+    psf_coeffs_centered, dxy = center_psf_coeffs(psf_coeffs)
+    print 'PSF centering shift:', dxy
+
     fig = plt.figure(figsize=(10,6), dpi=100)
-    psf_vmax = np.max(np.abs(psf_coeffs))
+    psf_vmax = np.max(np.abs(psf_coeffs_centered))
 
     order_label = [r'$1$', r'$x$', r'$y$', r'$x^2$', r'$y^2$', r'$xy$']
 
     for k in range(6):
         ax = fig.add_subplot(2,3,k+1)
 
-        ax.imshow(psf_coeffs[k].T, origin='upper', aspect='equal',
+        ax.imshow(psf_coeffs_centered[k].T, origin='upper', aspect='equal',
                   interpolation='nearest', cmap='bwr_r',
                   vmin=-psf_vmax, vmax=psf_vmax)
 
@@ -870,9 +958,9 @@ def test_extract_psf(replace_with_mock=False):
     plt.close(fig)
 
     # Plot the PSF across the CCD
-    for pc, plt_fname, plt_title in ((psf_coeffs, 'psf_fit_over_ccd', r'$\mathrm{PSF \ Fit}$'),
+    for pc, plt_fname, plt_title in ((psf_coeffs_centered, 'psf_fit_over_ccd', r'$\mathrm{PSF \ Fit}$'),
                                      (psf_coeffs_model, 'psf_model_over_ccd', r'$\mathrm{PSF \ Model}$'),
-                                     (psf_coeffs-psf_coeffs_model, 'psf_resid_over_ccd', r'$\mathrm{PSF \ residuals}$')):
+                                     (psf_coeffs_centered-psf_coeffs_model, 'psf_resid_over_ccd', r'$\mathrm{PSF \ residuals}$')):
         for vmax in [1., 0.1, 0.01, 0.001]:
             fig = plt.figure(figsize=(12,12), dpi=120)
 
@@ -1044,6 +1132,7 @@ def test_extract_psf(replace_with_mock=False):
         tmp[star_dict['ps_mask'][k] != 0] = np.nan
 
         chi = tmp * np.sqrt(star_dict['ps_weight'][k])
+        psf_resid_tmp = np.mean(chi**2)
 
         ax = fig.add_subplot(n_x, n_y, k+1, axisbg='g')
         ax_stretch = fig_stretch.add_subplot(n_x, n_y, k+1, axisbg='g')
@@ -1064,7 +1153,7 @@ def test_extract_psf(replace_with_mock=False):
         x_txt = xlim[0] + 0.05 * (xlim[1] - xlim[0])
         y_txt = ylim[0] + 0.05 * (ylim[1] - ylim[0])
 
-        txt = r'${:.1f}$'.format(psf_resid[k])
+        txt = r'${:.1f}\, , \, {:.1f}$'.format(psf_resid[k], psf_resid_tmp)
         ax.text(x_txt, y_txt, txt)
         ax_stretch.text(x_txt, y_txt, txt)
         ax_weighted.text(x_txt, y_txt, txt)
@@ -1150,10 +1239,11 @@ def test_extract_psf(replace_with_mock=False):
 def main():
     #test_chisq(add_secondary_sources=False)
     #test_psf_coeff_fit()
-    test_extract_psf(replace_with_mock=False)
+    test_extract_psf(replace_with_mock=True)
     #test_gen_data()
     #test_shift_stars()
     #test_star_fit()
+    #test_center_psf_coeffs()
 
     return 0
 
