@@ -69,7 +69,7 @@ def _ccds_table(camera='decam'):
         ('plver', 'S8'),
         ('procdate', 'S19'),
         ('plprocid', 'S7'),
-        ('ccdname', 'S5'),
+        ('ccdname', 'S4'),
         ('ccdnum', 'i2'),
         ('expid', 'S17'),
         ('object', 'S35'),
@@ -145,10 +145,10 @@ def _stars_table(nstars=1):
     return stars
 
 def get_pixscale(camera):
-  return {'decam':0.262,
-          'mosaic':0.262,
-          '90prime':0.455,
-          'megaprime':0.185}[camera]
+  return {'decam':     0.262,
+          'mosaic':    0.262,
+          '90prime':   0.455,
+          'megaprime': 0.185}[camera]
 
 def cols_for_survey_table(which='all'):
     """Return list of -survey.fits table colums
