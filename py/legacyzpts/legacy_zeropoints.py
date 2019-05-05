@@ -60,13 +60,11 @@ def _ccds_table(camera='decam'):
     Description and Units at:
     https://github.com/legacysurvey/legacyzpts/blob/master/DESCRIPTION_OF_OUTPUTS.md
     '''
-    max_camera_length = max([len(c) for c in CAMERAS])
-
     cols = [
         ('err_message', 'S30'),
         ('image_filename', 'S120'),
         ('image_hdu', 'i2'),
-        ('camera', 'S%i' % max_camera_length),
+        ('camera', 'S9',
         ('expnum', 'i8'),
         ('plver', 'S8'),
         ('procdate', 'S19'),
