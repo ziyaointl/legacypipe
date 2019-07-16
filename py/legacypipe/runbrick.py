@@ -31,7 +31,6 @@ import os
 
 import pylab as plt
 import numpy as np
-
 import fitsio
 
 from astrometry.util.fits import fits_table, merge_tables
@@ -42,6 +41,11 @@ from legacypipe.survey import get_rgb, imsave_jpeg
 from legacypipe.bits import DQ_BITS, MASKBITS
 from legacypipe.utils import RunbrickError, NothingToDoError, iterwrapper, find_unique_pixels
 from legacypipe.coadds import make_coadds, write_coadd_images, quick_coadds
+
+##############Profile
+import cProfile
+##############Profile
+
 
 # RGB image args used in the tile viewer:
 rgbkwargs = dict(mnmx=(-3,300.), arcsinh=1.)
@@ -3465,7 +3469,9 @@ def main(args=None):
 
     rtn = -1
     try:
-        run_brick(opt.brick, survey, **kwargs)
+########Profile
+        cProfile.run('run_brick(opt.brick, survey, **kwargs)', 'src_stats')
+########Profile
         rtn = 0
     except NothingToDoError as e:
         print()
